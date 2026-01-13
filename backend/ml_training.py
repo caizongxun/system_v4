@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import List, Tuple, Dict, Optional
+import time
 
 import numpy as np
 import pandas as pd
@@ -70,6 +71,7 @@ def load_klines(symbol: str, timeframe: str) -> pd.DataFrame:
     filename = f"{base}_{timeframe}.parquet"
     path_in_repo = f"klines/{symbol}/{filename}"
 
+    print(f"  Downloading {path_in_repo}...")
     local_path = hf_hub_download(
         repo_id=REPO_ID,
         filename=path_in_repo,
@@ -84,6 +86,7 @@ def load_klines(symbol: str, timeframe: str) -> pd.DataFrame:
         df = df.set_index("open_time")
 
     df = df.sort_index()
+    print(f"  Loaded {len(df)} bars")
     return df
 
 
@@ -189,7 +192,7 @@ def build_trade_labels(
     n = len(df)
 
     labels = np.full(n, TradeLabel.FLAT, dtype=int)
-    trade_end_indices = np.full(n, -1, dtype=int)  # Track where each trade ends
+    trade_end_indices = np.full(n, -1, dtype=int)
 
     i = 0
     debug_count = 0
@@ -275,7 +278,7 @@ def build_trade_labels(
         labels[i] = int(outcome)
 
         if debug and debug_count < 10 and outcome != TradeLabel.FLAT:
-            print(f"Bar {i}: entry={entry:.2f}, atr={atr[i]:.2f}, "
+            print(f"  Bar {i}: entry={entry:.2f}, atr={atr[i]:.2f}, "
                   f"long_tp={long_tp:.2f} (hit@{long_tp_hit}), "
                   f"long_sl={long_sl:.2f} (hit@{long_sl_hit}), "
                   f"short_tp={short_tp:.2f} (hit@{short_tp_hit}), "
@@ -307,14 +310,18 @@ def build_feature_dataframe(
     atr_cfg: ATRConfig,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """End-to-end feature and label construction for a single symbol/timeframe."""
-
+    print("  Computing momentum and volatility features...")
     df_feat = add_momentum_and_volatility_features(df)
+    
+    print("  Building custom composite indicators...")
     df_feat = add_custom_composite_indicators(df_feat)
 
     # Drop early rows with NaNs from rolling calculations
     df_feat = df_feat.dropna().copy()
+    print(f"  After dropping NaNs: {len(df_feat)} bars")
 
     # Build labels
+    print("  Constructing trade labels...")
     labels = build_trade_labels(df_feat, atr_cfg=atr_cfg, debug=True)
 
     # Align and drop rows without labels
@@ -342,22 +349,34 @@ def build_feature_dataframe(
 
 
 def train_baseline_model(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifier:
-    """Train a baseline RandomForest classifier."""
+    """Train a RandomForest classifier with class weight balancing."""
+    print("  Splitting into train/test (80/20)...")
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, shuffle=False
     )
+    print(f"    Train: {len(X_train)}, Test: {len(X_test)}")
 
+    print("  Training RandomForest (n_estimators=200, max_depth=8)...")
+    start_time = time.time()
+    
     model = RandomForestClassifier(
         n_estimators=200,
         max_depth=8,
         n_jobs=-1,
         random_state=42,
         class_weight="balanced_subsample",
+        verbose=1,
     )
     model.fit(X_train, y_train)
+    
+    elapsed = time.time() - start_time
+    print(f"  Training completed in {elapsed:.2f}s")
 
+    print("\n  Making predictions on test set...")
     y_pred = model.predict(X_test)
-    print("Classification report:")
+    
+    print("\nClassification Report:")
+    print("="*60)
     print(
         classification_report(
             y_test,
@@ -371,8 +390,24 @@ def train_baseline_model(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifie
             zero_division=0,
         )
     )
-    print("\nConfusion matrix:")
-    print(confusion_matrix(y_test, y_pred))
+    
+    print("\nConfusion Matrix:")
+    print("="*60)
+    cm = confusion_matrix(y_test, y_pred)
+    print(f"           Pred FLAT  Pred LONG  Pred SHORT")
+    print(f"Actual FLAT   {cm[0,0]:6d}    {cm[0,1]:6d}     {cm[0,2]:6d}")
+    print(f"Actual LONG   {cm[1,0]:6d}    {cm[1,1]:6d}     {cm[1,2]:6d}")
+    print(f"Actual SHORT  {cm[2,0]:6d}    {cm[2,1]:6d}     {cm[2,2]:6d}")
+    
+    print("\nFeature Importance (Top 10):")
+    print("="*60)
+    feature_importance = pd.DataFrame({
+        'feature': X.columns,
+        'importance': model.feature_importances_
+    }).sort_values('importance', ascending=False)
+    
+    for idx, row in feature_importance.head(10).iterrows():
+        print(f"{row['feature']:20s}: {row['importance']:.4f}")
 
     return model
 
@@ -391,10 +426,14 @@ def main():
 
     atr_cfg = ATRConfig(period=14, stop_atr=1.0, rr_ratio=1.5)
 
-    print("Building features and labels...")
+    print("\nBuilding features and labels...")
     X, y = build_feature_dataframe(df, atr_cfg)
-    print(f"Dataset shape: X={X.shape}, y={y.shape}")
-    print(f"Label distribution: {y.value_counts().to_dict()}")
+    print(f"\nDataset shape: X={X.shape}, y={y.shape}")
+    print(f"Label distribution:\n{y.value_counts().sort_index().to_string()}")
+    print(f"Label percentages:")
+    for label_val in [0, 1, 2]:
+        pct = (y == label_val).sum() / len(y) * 100
+        print(f"  {TradeLabel(label_val).name:5s}: {pct:6.2f}%")
 
     print("\nTraining baseline model...")
     _ = train_baseline_model(X, y)
