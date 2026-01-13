@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import json
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import asyncio
 import threading
 import time
@@ -51,34 +51,58 @@ user_indicator_config = IndicatorConfiguration()
 
 # ============== Helper Functions ==============
 
-def clean_json_value(value):
+def clean_json_value(value: Any) -> Any:
     """
     Convert numpy/pandas values to JSON-safe format.
     Handles NaN, Inf, and other special values.
     """
+    # Handle pandas Timestamp
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    
+    # Handle pandas NA
     if pd.isna(value):
         return None
-    elif isinstance(value, (np.inf, float)) and np.isinf(value):
-        return None
-    elif isinstance(value, (np.integer, np.floating)):
+    
+    # Handle numpy inf
+    try:
+        if np.isinf(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    
+    # Handle numpy types
+    if isinstance(value, np.integer):
+        return int(value)
+    elif isinstance(value, np.floating):
         return float(value)
-    elif isinstance(value, (int, float)):
+    elif isinstance(value, np.ndarray):
+        return value.tolist()
+    elif isinstance(value, (int, float, str, bool, type(None))):
         return value
     else:
         return str(value)
 
 
-def clean_dict_for_json(data: Dict) -> Dict:
+def clean_dict_for_json(data: Any) -> Any:
     """
     Recursively clean dictionary for JSON serialization.
-    Handles nested dictionaries and lists.
+    Handles nested dictionaries, lists, and pandas objects.
     """
     if isinstance(data, dict):
-        return {k: clean_dict_for_json(v) for k, v in data.items()}
+        result = {}
+        for k, v in data.items():
+            # Convert pandas Timestamp keys to strings
+            if isinstance(k, pd.Timestamp):
+                k = k.isoformat()
+            result[str(k)] = clean_dict_for_json(v)
+        return result
     elif isinstance(data, (list, tuple)):
         return [clean_dict_for_json(item) for item in data]
-    elif isinstance(data, pd.Timestamp):
-        return data.isoformat()
+    elif isinstance(data, pd.Series):
+        return clean_dict_for_json(data.to_dict())
+    elif isinstance(data, pd.DataFrame):
+        return clean_dict_for_json(data.to_dict(orient='index'))
     else:
         return clean_json_value(data)
 
@@ -168,7 +192,10 @@ async def get_klines(
         
         # Extract K-line data and clean for JSON
         klines_subset = klines[['open', 'high', 'low', 'close', 'volume']].tail(limit)
-        klines_dict = klines_subset.to_dict(orient='index')
+        klines_dict = {}
+        for timestamp, row in klines_subset.iterrows():
+            timestamp_str = timestamp.isoformat() if isinstance(timestamp, pd.Timestamp) else str(timestamp)
+            klines_dict[timestamp_str] = row.to_dict()
         klines_dict = clean_dict_for_json(klines_dict)
         
         # Build response
@@ -188,7 +215,10 @@ async def get_klines(
                 response_data["indicators"][indicator_name] = {"error": result["error"]}
             else:
                 indicator_values = result["values"].tail(limit)
-                indicator_dict = indicator_values.to_dict(orient='index')
+                indicator_dict = {}
+                for timestamp, row in indicator_values.iterrows():
+                    timestamp_str = timestamp.isoformat() if isinstance(timestamp, pd.Timestamp) else str(timestamp)
+                    indicator_dict[timestamp_str] = row.to_dict()
                 indicator_dict = clean_dict_for_json(indicator_dict)
                 response_data["indicators"][indicator_name] = indicator_dict
         
@@ -197,7 +227,7 @@ async def get_klines(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error fetching klines: {str(e)}")
+        logger.error(f"Error fetching klines: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -342,7 +372,10 @@ async def websocket_chart(
                     klines = KLineDataLoader.load_klines(symbol, timeframe)
                     latest = klines.tail(1)
                     
-                    latest_data = latest[['open', 'high', 'low', 'close', 'volume']].to_dict(orient='index')
+                    latest_data = {}
+                    for timestamp, row in latest[['open', 'high', 'low', 'close', 'volume']].iterrows():
+                        timestamp_str = timestamp.isoformat() if isinstance(timestamp, pd.Timestamp) else str(timestamp)
+                        latest_data[timestamp_str] = row.to_dict()
                     latest_data = clean_dict_for_json(latest_data)
                     
                     response = {
