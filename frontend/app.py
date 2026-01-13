@@ -14,15 +14,17 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QPushButton, QLabel, QCheckBox, QSpinBox, QTableWidget,
     QTableWidgetItem, QTabWidget, QGridLayout, QGroupBox, QMessageBox,
-    QProgressBar
+    QProgressBar, QSlider
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QColor
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
 from matplotlib.figure import Figure
 import pandas as pd
+import numpy as np
 
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent / 'backend'))
@@ -70,14 +72,161 @@ class DataFetchThread(QThread):
             self.error.emit(f"Failed to fetch data: {str(e)}")
 
 
-class ChartWidget(FigureCanvas):
-    """Matplotlib chart widget for PyQt5."""
+class InteractiveChartWidget(FigureCanvas):
+    """Interactive matplotlib chart widget for PyQt5 with zoom/pan/crosshair."""
     
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         self.fig = Figure(figsize=(width, height), dpi=dpi, facecolor='white')
         self.axes = self.fig.add_subplot(111)
         super().__init__(self.fig)
         self.setParent(parent)
+        
+        # Add toolbar for navigation
+        self.toolbar = NavigationToolbar2QT(self, parent)
+        
+        # Interactive features
+        self.press = None
+        self.xpress = None
+        self.ypress = None
+        self.cur_xlim = None
+        self.cur_ylim = None
+        
+        # Crosshair
+        self.crosshair_on = False
+        self.crosshair = None
+        self.vline = None
+        self.hline = None
+        
+        # Data for interaction
+        self.x_data = None
+        self.y_data = None
+        
+        # Connect events
+        self.mpl_connect('press_event', self.on_press)
+        self.mpl_connect('release_event', self.on_release)
+        self.mpl_connect('motion_notify_event', self.on_motion)
+        self.mpl_connect('scroll_event', self.on_scroll)
+        self.mpl_connect('figure_leave_event', self.on_leave)
+    
+    def on_press(self, event):
+        """Mouse button pressed."""
+        if event.inaxes != self.axes:
+            return
+        
+        self.cur_xlim = self.axes.get_xlim()
+        self.cur_ylim = self.axes.get_ylim()
+        self.press = [event.xdata, event.ydata]
+        self.xpress = event.xdata
+        self.ypress = event.ydata
+    
+    def on_release(self, event):
+        """Mouse button released."""
+        self.press = None
+        self.xpress = None
+        self.ypress = None
+    
+    def on_motion(self, event):
+        """Mouse motion event - for panning and crosshair."""
+        if event.inaxes != self.axes:
+            return
+        
+        # Update crosshair
+        self._update_crosshair(event.xdata, event.ydata)
+        
+        # Pan (middle mouse button or right click)
+        if self.press is not None:
+            dx = event.xdata - self.press[0]
+            dy = event.ydata - self.press[1]
+            
+            if event.button == 2:  # Middle mouse button
+                new_xlim = [self.cur_xlim[0] - dx, self.cur_xlim[1] - dx]
+                new_ylim = [self.cur_ylim[0] - dy, self.cur_ylim[1] - dy]
+                
+                self.axes.set_xlim(new_xlim)
+                self.axes.set_ylim(new_ylim)
+                self.draw_idle()
+    
+    def on_scroll(self, event):
+        """Mouse scroll event - for zooming."""
+        if event.inaxes != self.axes:
+            return
+        
+        # Get current axis limits
+        cur_xlim = self.axes.get_xlim()
+        cur_ylim = self.axes.get_ylim()
+        
+        # Get event location
+        xdata = event.xdata
+        ydata = event.ydata
+        
+        # Set zoom factor
+        if event.button == 'up':
+            # Zoom in
+            scale_factor = 0.8
+        elif event.button == 'down':
+            # Zoom out
+            scale_factor = 1.2
+        else:
+            return
+        
+        # Calculate new limits
+        new_width = (cur_xlim[1] - cur_xlim[0]) * scale_factor
+        new_height = (cur_ylim[1] - cur_ylim[0]) * scale_factor
+        
+        relx = (cur_xlim[1] - xdata) / (cur_xlim[1] - cur_xlim[0])
+        rely = (cur_ylim[1] - ydata) / (cur_ylim[1] - cur_ylim[0])
+        
+        new_xlim = [xdata - new_width * (1 - relx), xdata + new_width * relx]
+        new_ylim = [ydata - new_height * (1 - rely), ydata + new_height * rely]
+        
+        self.axes.set_xlim(new_xlim)
+        self.axes.set_ylim(new_ylim)
+        self.draw_idle()
+    
+    def on_leave(self, event):
+        """Mouse leaves the plot."""
+        self._remove_crosshair()
+    
+    def _update_crosshair(self, xdata, ydata):
+        """Update crosshair position."""
+        if not self.crosshair_on:
+            return
+        
+        # Remove old crosshair
+        if self.vline is not None:
+            self.vline.remove()
+        if self.hline is not None:
+            self.hline.remove()
+        
+        # Draw new crosshair
+        self.vline = self.axes.axvline(color='k', linestyle='--', alpha=0.3, linewidth=0.5)
+        self.hline = self.axes.axhline(color='k', linestyle='--', alpha=0.3, linewidth=0.5)
+        
+        self.vline.set_xdata(xdata)
+        self.hline.set_ydata(ydata)
+        
+        self.draw_idle()
+    
+    def _remove_crosshair(self):
+        """Remove crosshair."""
+        if self.vline is not None:
+            self.vline.remove()
+            self.vline = None
+        if self.hline is not None:
+            self.hline.remove()
+            self.hline = None
+        self.draw_idle()
+    
+    def enable_crosshair(self, enabled=True):
+        """Enable or disable crosshair."""
+        self.crosshair_on = enabled
+        if not enabled:
+            self._remove_crosshair()
+    
+    def reset_view(self):
+        """Reset to initial view."""
+        self.axes.autoscale()
+        self.draw_idle()
     
     def plot_candlestick(self, klines_data):
         """Plot candlestick chart with TradingView-like styling."""
@@ -97,6 +246,10 @@ class ChartWidget(FigureCanvas):
             df[col] = pd.to_numeric(df[col], errors='coerce')
         
         df = df.dropna()
+        
+        # Store data for interaction
+        self.x_data = np.arange(len(df))
+        self.y_data = df['close'].values
         
         # Plot candlesticks
         width = 0.6
@@ -122,7 +275,7 @@ class ChartWidget(FigureCanvas):
                 self.axes.bar(idx, open_price - close_price, width=width2, 
                             bottom=close_price, color=color, edgecolor=color)
         
-        self.axes.set_title('Price Chart', fontsize=12, fontweight='bold')
+        self.axes.set_title('Price Chart - Scroll to Zoom, Middle Click to Pan', fontsize=12, fontweight='bold')
         self.axes.set_xlabel('Time', fontsize=10)
         self.axes.set_ylabel('Price', fontsize=10)
         self.axes.grid(True, alpha=0.3)
@@ -146,7 +299,7 @@ class ChartWidget(FigureCanvas):
             self.axes.plot(df.index, df['macd'], label='MACD', color='blue')
             self.axes.plot(df.index, df['macd_signal'], label='Signal', color='red')
             self.axes.bar(df.index, df['macd_histogram'], label='Histogram', alpha=0.3, color='gray')
-            self.axes.set_title('MACD', fontsize=12, fontweight='bold')
+            self.axes.set_title('MACD - Scroll to Zoom', fontsize=12, fontweight='bold')
             self.axes.legend()
             self.axes.grid(True, alpha=0.3)
         
@@ -158,7 +311,7 @@ class ChartWidget(FigureCanvas):
             self.axes.axhline(y=70, color='r', linestyle='--', alpha=0.5, label='Overbought')
             self.axes.axhline(y=30, color='g', linestyle='--', alpha=0.5, label='Oversold')
             self.axes.fill_between(df.index, 30, 70, alpha=0.1, color='gray')
-            self.axes.set_title('RSI', fontsize=12, fontweight='bold')
+            self.axes.set_title('RSI - Scroll to Zoom', fontsize=12, fontweight='bold')
             self.axes.set_ylim([0, 100])
             self.axes.legend()
             self.axes.grid(True, alpha=0.3)
@@ -173,7 +326,7 @@ class ChartWidget(FigureCanvas):
             self.axes.plot(df.index, df['bb_middle'], label='Middle (SMA)', color='blue')
             self.axes.plot(df.index, df['bb_lower'], label='Lower', color='green', linestyle='--')
             self.axes.fill_between(df.index, df['bb_upper'], df['bb_lower'], alpha=0.1, color='blue')
-            self.axes.set_title('Bollinger Bands', fontsize=12, fontweight='bold')
+            self.axes.set_title('Bollinger Bands - Scroll to Zoom', fontsize=12, fontweight='bold')
             self.axes.legend()
             self.axes.grid(True, alpha=0.3)
         
@@ -238,6 +391,11 @@ class System_V4_App(QMainWindow):
         self.refresh_btn.clicked.connect(self.fetch_data)
         control_layout.addWidget(self.refresh_btn)
         
+        # Reset view button
+        self.reset_btn = QPushButton('Reset View')
+        self.reset_btn.clicked.connect(self.reset_chart_view)
+        control_layout.addWidget(self.reset_btn)
+        
         # Spacer
         control_layout.addStretch()
         
@@ -265,6 +423,12 @@ class System_V4_App(QMainWindow):
         self.bb_check.stateChanged.connect(self.on_indicator_changed)
         indicator_layout.addWidget(self.bb_check)
         
+        # Crosshair checkbox
+        self.crosshair_check = QCheckBox('Enable Crosshair')
+        self.crosshair_check.setChecked(False)
+        self.crosshair_check.stateChanged.connect(self.on_crosshair_changed)
+        indicator_layout.addWidget(self.crosshair_check)
+        
         indicator_layout.addStretch()
         main_layout.addLayout(indicator_layout)
         
@@ -272,17 +436,17 @@ class System_V4_App(QMainWindow):
         self.tab_widget = QTabWidget()
         
         # Price chart
-        self.price_chart = ChartWidget()
+        self.price_chart = InteractiveChartWidget()
         self.tab_widget.addTab(self.price_chart, 'Price Chart')
         
         # Indicator charts
-        self.macd_chart = ChartWidget()
+        self.macd_chart = InteractiveChartWidget()
         self.tab_widget.addTab(self.macd_chart, 'MACD')
         
-        self.rsi_chart = ChartWidget()
+        self.rsi_chart = InteractiveChartWidget()
         self.tab_widget.addTab(self.rsi_chart, 'RSI')
         
-        self.bb_chart = ChartWidget()
+        self.bb_chart = InteractiveChartWidget()
         self.tab_widget.addTab(self.bb_chart, 'Bollinger Bands')
         
         main_layout.addWidget(self.tab_widget)
@@ -402,6 +566,21 @@ class System_V4_App(QMainWindow):
     def on_indicator_changed(self):
         """Called when indicator checkboxes change."""
         self.update_charts()
+    
+    def on_crosshair_changed(self):
+        """Called when crosshair checkbox changes."""
+        enabled = self.crosshair_check.isChecked()
+        self.price_chart.enable_crosshair(enabled)
+        self.macd_chart.enable_crosshair(enabled)
+        self.rsi_chart.enable_crosshair(enabled)
+        self.bb_chart.enable_crosshair(enabled)
+    
+    def reset_chart_view(self):
+        """Reset all chart views to initial state."""
+        self.price_chart.reset_view()
+        self.macd_chart.reset_view()
+        self.rsi_chart.reset_view()
+        self.bb_chart.reset_view()
     
     def auto_refresh(self):
         """Auto refresh data."""
