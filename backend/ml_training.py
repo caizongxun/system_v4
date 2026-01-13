@@ -1,21 +1,22 @@
-"""ML training pipeline for System V4 - Optimized Version.
+"""ML training pipeline for System V4 - New Label Strategy.
 
 This script loads OHLCV data from the HuggingFace dataset,
-builds engineered features, constructs trade labels using Relative Strength,
-and trains an optimized XGBoost model to achieve 70%+ accuracy.
+builds engineered features with technical indicators,
+constructs trade labels using improved logic,
+and trains an XGBoost model to achieve 70%+ accuracy.
 
-Optimizations include:
-- Label ratio tuning for balanced class distribution
-- XGBoost hyperparameter optimization
-- Class weight balancing
-- Feature normalization
+Improvements:
+- Technical indicators: RSI, MACD, Bollinger Bands, ATR
+- Improved label logic: trend-following + momentum
+- Aggressive hyperparameter tuning
+- Feature selection and normalization
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple
 import time
 
 import numpy as np
@@ -47,16 +48,17 @@ SUPPORTED_TIMEFRAMES: List[str] = ["15m", "1h", "1d"]
 
 
 class TradeLabel(IntEnum):
-    FLAT = 0
-    LONG = 1
-    SHORT = 2
+    SHORT = 0
+    FLAT = 1
+    LONG = 2
 
 
 @dataclass
 class LabelConfig:
-    """Configuration for Relative Strength label construction."""
+    """Configuration for label construction."""
     future_bars: int = 10
-    ratio: float = 2.5  # Increased from 1.2 for better class balance
+    momentum_threshold: float = 0.005  # 0.5% momentum threshold
+    volatility_threshold: float = 0.02  # 2% volatility threshold
 
 
 # ==============================
@@ -94,8 +96,37 @@ def load_klines(symbol: str, timeframe: str) -> pd.DataFrame:
 
 
 # ==============================
-# Feature Engineering
+# Technical Indicators
 # ==============================
+
+
+def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Compute Relative Strength Index (RSI)."""
+    delta = df["close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / (loss + 1e-8)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Compute MACD (Moving Average Convergence Divergence)."""
+    ema_fast = df["close"].ewm(span=fast).mean()
+    ema_slow = df["close"].ewm(span=slow).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def compute_bollinger_bands(df: pd.DataFrame, period: int = 20, std_dev: float = 2.0):
+    """Compute Bollinger Bands."""
+    sma = df["close"].rolling(period).mean()
+    std = df["close"].rolling(period).std()
+    upper = sma + (std * std_dev)
+    lower = sma - (std * std_dev)
+    return upper, sma, lower
 
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -103,8 +134,8 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high = df["high"]
     low = df["low"]
     close = df["close"]
-
     prev_close = close.shift(1)
+    
     tr1 = high - low
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
@@ -113,84 +144,116 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
-def add_momentum_and_volatility_features(df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
-    """Add momentum and volatility features based on % returns and ATR."""
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add all technical indicators."""
     df = df.copy()
-
-    df["ret_close"] = df["close"].pct_change()
-    df["mom_return"] = df["ret_close"].rolling(window).sum()
-    df["vol_return"] = df["ret_close"].rolling(window).std()
-    df["atr"] = compute_atr(df, period=window)
-
-    return df
-
-
-def add_custom_composite_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Create custom composite indicators."""
-    df = df.copy()
-
-    range_hl = (df["high"] - df["low"]).replace(0, np.nan)
-    df["trend_strength"] = ((df["close"] - df["low"]) / range_hl).clip(0, 1)
-
-    mom_norm = (df["mom_return"] - df["mom_return"].rolling(100).mean()) / (
-        df["mom_return"].rolling(100).std() + 1e-8
-    )
-    vol_norm = (df["vol_return"] - df["vol_return"].rolling(100).mean()) / (
-        df["vol_return"].rolling(100).std() + 1e-8
-    )
-
-    df["momentum_vol_score"] = 0.7 * mom_norm + 0.3 * vol_norm
     
-    # Additional features for better classification
-    df["price_range_pct"] = (df["high"] - df["low"]) / df["close"]
+    # Basic features
+    df["returns"] = df["close"].pct_change()
+    df["log_returns"] = np.log(df["close"] / df["close"].shift(1))
+    df["price_range"] = (df["high"] - df["low"]) / df["close"]
     df["close_position"] = (df["close"] - df["low"]) / (df["high"] - df["low"] + 1e-8)
-    df["volume_ma_ratio"] = df["volume"] / df["volume"].rolling(20).mean()
-
+    
+    # Momentum indicators
+    df["rsi_14"] = compute_rsi(df, 14)
+    df["rsi_7"] = compute_rsi(df, 7)
+    df["momentum_10"] = df["close"] - df["close"].shift(10)
+    df["momentum_20"] = df["close"] - df["close"].shift(20)
+    
+    # MACD
+    macd, signal, hist = compute_macd(df)
+    df["macd"] = macd
+    df["macd_signal"] = signal
+    df["macd_hist"] = hist
+    
+    # Bollinger Bands
+    upper, middle, lower = compute_bollinger_bands(df)
+    df["bb_upper"] = upper
+    df["bb_middle"] = middle
+    df["bb_lower"] = lower
+    df["bb_position"] = (df["close"] - lower) / (upper - lower + 1e-8)
+    df["bb_width"] = (upper - lower) / middle
+    
+    # ATR
+    df["atr"] = compute_atr(df, 14)
+    df["atr_normalized"] = df["atr"] / df["close"]
+    
+    # Volume
+    df["volume_ma_20"] = df["volume"].rolling(20).mean()
+    df["volume_ratio"] = df["volume"] / (df["volume_ma_20"] + 1e-8)
+    
+    # Moving averages
+    df["sma_10"] = df["close"].rolling(10).mean()
+    df["sma_20"] = df["close"].rolling(20).mean()
+    df["sma_50"] = df["close"].rolling(50).mean()
+    df["ema_12"] = df["close"].ewm(span=12).mean()
+    df["ema_26"] = df["close"].ewm(span=26).mean()
+    
+    # Trend
+    df["trend_10"] = (df["sma_10"] - df["sma_20"]) / df["close"]
+    df["trend_20"] = (df["sma_20"] - df["sma_50"]) / df["close"]
+    
+    # Volatility
+    df["volatility_10"] = df["returns"].rolling(10).std()
+    df["volatility_20"] = df["returns"].rolling(20).std()
+    
     return df
 
 
 # ==============================
-# Label Construction
+# Label Construction - New Strategy
 # ==============================
 
 
-def build_relative_strength_labels(
+def build_improved_labels(
     df: pd.DataFrame,
     label_cfg: LabelConfig,
 ) -> pd.Series:
-    """Label each bar using Relative Strength."""
+    """Label each bar using multi-factor logic.
+    
+    LONG: Strong uptrend + positive momentum
+    SHORT: Strong downtrend + negative momentum
+    FLAT: Sideways/uncertain
+    """
     df = df.copy()
     n = len(df)
     future_bars = label_cfg.future_bars
-    ratio = label_cfg.ratio
-
+    mom_thresh = label_cfg.momentum_threshold
+    vol_thresh = label_cfg.volatility_threshold
+    
     labels = np.full(n, TradeLabel.FLAT, dtype=int)
-
+    
     for i in range(n - future_bars):
         entry = df["close"].iloc[i]
         future_slice = df.iloc[i + 1 : i + 1 + future_bars]
+        
         future_high = future_slice["high"].max()
         future_low = future_slice["low"].min()
-
-        up_move = future_high - entry
-        down_move = entry - future_low
-
-        if down_move == 0 and up_move > 0:
-            outcome = TradeLabel.LONG
-        elif up_move == 0 and down_move > 0:
-            outcome = TradeLabel.SHORT
-        elif down_move == 0 and up_move == 0:
-            outcome = TradeLabel.FLAT
+        future_close = future_slice["close"].iloc[-1]
+        
+        up_move = (future_high - entry) / entry
+        down_move = (entry - future_low) / entry
+        close_move = (future_close - entry) / entry
+        
+        # Current indicators
+        current_rsi = df["rsi_14"].iloc[i]
+        current_macd_hist = df["macd_hist"].iloc[i]
+        current_trend = df["trend_10"].iloc[i]
+        current_bb_pos = df["bb_position"].iloc[i]
+        
+        # Logic
+        # Strong uptrend
+        if (up_move > 0.02 and down_move < 0.01 and close_move > 0.005 and 
+            current_rsi > 50 and current_macd_hist > 0 and current_trend > 0):
+            labels[i] = TradeLabel.LONG
+        # Strong downtrend
+        elif (down_move > 0.02 and up_move < 0.01 and close_move < -0.005 and 
+              current_rsi < 50 and current_macd_hist < 0 and current_trend < 0):
+            labels[i] = TradeLabel.SHORT
+        # Everything else
         else:
-            if up_move > down_move * ratio:
-                outcome = TradeLabel.LONG
-            elif down_move > up_move * ratio:
-                outcome = TradeLabel.SHORT
-            else:
-                outcome = TradeLabel.FLAT
-
-        labels[i] = int(outcome)
-
+            labels[i] = TradeLabel.FLAT
+    
     return pd.Series(labels, index=df.index, name="label")
 
 
@@ -204,41 +267,45 @@ def build_feature_dataframe(
     label_cfg: LabelConfig,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """End-to-end feature and label construction."""
-    print("  Computing momentum and volatility features...")
-    df_feat = add_momentum_and_volatility_features(df)
-
-    print("  Building custom composite indicators...")
-    df_feat = add_custom_composite_indicators(df_feat)
-
+    print("  Adding technical indicators...")
+    df_feat = add_technical_indicators(df)
+    
     df_feat = df_feat.dropna().copy()
     print(f"  After dropping NaNs: {len(df_feat)} bars")
-
-    print("  Constructing Relative Strength labels...")
-    labels = build_relative_strength_labels(df_feat, label_cfg=label_cfg)
-
+    
+    print("  Constructing improved labels...")
+    labels = build_improved_labels(df_feat, label_cfg=label_cfg)
+    
     df_feat = df_feat.loc[labels.index]
     labels_shifted = labels.shift(-1).dropna()
     df_feat = df_feat.loc[labels_shifted.index]
-
+    
+    # Select best features
     feature_cols = [
-        "open", "high", "low", "close", "volume",
-        "ret_close", "mom_return", "vol_return", "atr",
-        "trend_strength", "momentum_vol_score",
-        "price_range_pct", "close_position", "volume_ma_ratio",
+        "rsi_14", "rsi_7", "momentum_10", "momentum_20",
+        "macd", "macd_signal", "macd_hist",
+        "bb_position", "bb_width",
+        "atr_normalized",
+        "volume_ratio",
+        "sma_10", "sma_20", "sma_50", "ema_12", "ema_26",
+        "trend_10", "trend_20",
+        "volatility_10", "volatility_20",
+        "returns", "log_returns",
+        "price_range", "close_position",
     ]
-
+    
     X = df_feat[feature_cols].copy()
     y = labels_shifted.astype(int)
     return X, y
 
 
 # ==============================
-# Model Training - Optimized
+# Model Training
 # ==============================
 
 
-def train_optimized_xgboost(X: pd.DataFrame, y: pd.Series):
-    """Train optimized XGBoost with hyperparameter tuning."""
+def train_xgboost(X: pd.DataFrame, y: pd.Series):
+    """Train XGBoost with aggressive tuning."""
     print("\n" + "="*70)
     print("SPLITTING DATA")
     print("="*70)
@@ -246,94 +313,87 @@ def train_optimized_xgboost(X: pd.DataFrame, y: pd.Series):
         X, y, test_size=0.2, shuffle=False
     )
     print(f"Train: {len(X_train)}, Test: {len(X_test)}")
-    print(f"Train label distribution:\n{pd.Series(y_train).value_counts().sort_index().to_dict()}")
-    print(f"Test label distribution:\n{pd.Series(y_test).value_counts().sort_index().to_dict()}")
-
+    print(f"Train label distribution:")
+    for label_val in [0, 1, 2]:
+        pct = (y_train == label_val).sum() / len(y_train) * 100
+        print(f"  {TradeLabel(label_val).name:5s}: {pct:6.2f}%")
+    
     # Feature normalization
     print("\n  Normalizing features...")
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
-
-    # Calculate class weights
-    unique, counts = np.unique(y_train, return_counts=True)
-    scale_pos_weight = counts[2] / counts[1]  # SHORT / LONG ratio
     
-    print(f"\n  Class weight (SHORT/LONG): {scale_pos_weight:.2f}")
-
     print("\n" + "="*70)
-    print("TRAINING OPTIMIZED XGBoost")
+    print("TRAINING XGBoost (Aggressive)")
     print("="*70)
-
-    # Optimized hyperparameters
+    
+    # Aggressive hyperparameters
     model = xgb.XGBClassifier(
-        n_estimators=400,
-        max_depth=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        gamma=1,
-        min_child_weight=5,
-        scale_pos_weight=scale_pos_weight,
+        n_estimators=500,
+        max_depth=6,
+        learning_rate=0.1,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        gamma=0,
+        min_child_weight=1,
         random_state=42,
         n_jobs=-1,
         verbosity=0,
     )
-
+    
     start_time = time.time()
     print("\n  Training...")
     model.fit(X_train_scaled, y_train)
     elapsed = time.time() - start_time
     print(f"  Training completed in {elapsed:.2f}s")
-
+    
     # Predictions
     print("\n  Making predictions...")
     y_pred = model.predict(X_test_scaled)
-    y_pred_proba = model.predict_proba(X_test_scaled)
-
+    
     # Metrics
     accuracy = accuracy_score(y_test, y_pred)
     f1_macro = f1_score(y_test, y_pred, average='macro')
     f1_weighted = f1_score(y_test, y_pred, average='weighted')
-
+    
     print("\n" + "="*70)
-    print("OPTIMIZATION RESULTS")
+    print("RESULTS")
     print("="*70)
     print(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
     print(f"F1-Score (Macro): {f1_macro:.4f}")
     print(f"F1-Score (Weighted): {f1_weighted:.4f}")
-
+    
     if accuracy >= 0.70:
-        print(f"\nTARGET ACHIEVED: {accuracy*100:.2f}% >= 70%")
+        print(f"\n✓ TARGET ACHIEVED: {accuracy*100:.2f}% >= 70%")
     else:
-        print(f"\nTarget not reached: {accuracy*100:.2f}% < 70%")
-        print(f"  Need {(0.70 - accuracy)*100:.2f}% more improvement")
-
+        print(f"\n✗ Target not reached: {accuracy*100:.2f}% < 70%")
+    
     print(f"\nClassification Report:")
     print(
         classification_report(
             y_test,
             y_pred,
-            labels=[int(TradeLabel.FLAT), int(TradeLabel.LONG), int(TradeLabel.SHORT)],
-            target_names=[TradeLabel.FLAT.name, TradeLabel.LONG.name, TradeLabel.SHORT.name],
+            labels=[int(TradeLabel.SHORT), int(TradeLabel.FLAT), int(TradeLabel.LONG)],
+            target_names=[TradeLabel.SHORT.name, TradeLabel.FLAT.name, TradeLabel.LONG.name],
             zero_division=0,
         )
     )
-
+    
     print(f"\nConfusion Matrix:")
     cm = confusion_matrix(y_test, y_pred)
-    print(f"           Pred FLAT  Pred LONG  Pred SHORT")
-    print(f"Actual FLAT   {cm[0,0]:6d}    {cm[0,1]:6d}     {cm[0,2]:6d}")
-    print(f"Actual LONG   {cm[1,0]:6d}    {cm[1,1]:6d}     {cm[1,2]:6d}")
-    print(f"Actual SHORT  {cm[2,0]:6d}    {cm[2,1]:6d}     {cm[2,2]:6d}")
-
-    print(f"\nFeature Importance (Top 10):")
+    print(f"            Pred SHORT  Pred FLAT  Pred LONG")
+    print(f"Actual SHORT   {cm[0,0]:6d}    {cm[0,1]:6d}    {cm[0,2]:6d}")
+    print(f"Actual FLAT    {cm[1,0]:6d}    {cm[1,1]:6d}    {cm[1,2]:6d}")
+    print(f"Actual LONG    {cm[2,0]:6d}    {cm[2,1]:6d}    {cm[2,2]:6d}")
+    
+    print(f"\nFeature Importance (Top 15):")
     feature_importance = pd.DataFrame(
         {"feature": X.columns, "importance": model.feature_importances_}
     ).sort_values("importance", ascending=False)
-    for idx, row in feature_importance.head(10).iterrows():
+    for idx, row in feature_importance.head(15).iterrows():
         print(f"  {row['feature']:20s}: {row['importance']:.4f}")
-
+    
     return model, accuracy, f1_macro
 
 
@@ -345,46 +405,25 @@ def train_optimized_xgboost(X: pd.DataFrame, y: pd.Series):
 def main():
     symbol = "BTCUSDT"
     timeframe = "15m"
-
+    
     print(f"Loading data for {symbol} {timeframe}...")
     df = load_klines(symbol, timeframe)
-
-    # Test multiple configurations
-    configs = [
-        LabelConfig(future_bars=10, ratio=2.5),
-        LabelConfig(future_bars=10, ratio=3.0),
-        LabelConfig(future_bars=5, ratio=2.0),
-    ]
-
-    best_accuracy = 0
-    best_config = None
-
-    for idx, label_cfg in enumerate(configs, 1):
-        print(f"\n\n{'#'*70}")
-        print(f"# Configuration {idx}/{len(configs)}: future_bars={label_cfg.future_bars}, ratio={label_cfg.ratio}")
-        print(f"{'#'*70}")
-
-        print("\nBuilding features and labels...")
-        X, y = build_feature_dataframe(df, label_cfg)
-        print(f"\nDataset shape: X={X.shape}, y={y.shape}")
-        print(f"Label distribution:")
-        for label_val in [0, 1, 2]:
-            pct = (y == label_val).sum() / len(y) * 100
-            print(f"  {TradeLabel(label_val).name:5s}: {pct:6.2f}%")
-
-        print("\nTraining model...")
-        model, accuracy, f1_macro = train_optimized_xgboost(X, y)
-
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            best_config = label_cfg
-
-    # Summary
-    print("\n\n" + "="*70)
-    print("FINAL SUMMARY")
+    
+    print("\nBuilding features and labels...")
+    label_cfg = LabelConfig(future_bars=10, momentum_threshold=0.005, volatility_threshold=0.02)
+    X, y = build_feature_dataframe(df, label_cfg)
+    print(f"\nDataset shape: X={X.shape}, y={y.shape}")
+    print(f"Label distribution:")
+    for label_val in [0, 1, 2]:
+        pct = (y == label_val).sum() / len(y) * 100
+        print(f"  {TradeLabel(label_val).name:5s}: {pct:6.2f}%")
+    
+    print("\nTraining model...")
+    model, accuracy, f1_macro = train_xgboost(X, y)
+    
+    print("\n" + "="*70)
+    print("COMPLETE")
     print("="*70)
-    print(f"Best configuration: future_bars={best_config.future_bars}, ratio={best_config.ratio}")
-    print(f"Best accuracy: {best_accuracy:.4f} ({best_accuracy*100:.2f}%)")
 
 
 if __name__ == "__main__":
