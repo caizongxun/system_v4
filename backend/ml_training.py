@@ -3,7 +3,7 @@
 This script loads OHLCV data from the HuggingFace dataset
 `zongowo111/v2-crypto-ohlcv-data`, builds engineered features
 (momentum, volatility and custom composite indicators),
-constructs trade labels based on ATR stop loss and 1:1.5 risk-reward,
+constructs trade labels based on Relative Strength (comparing upside vs downside moves),
 then trains a baseline model to predict whether to enter long, short or stay flat
 on the next bar given the last fully closed bar.
 
@@ -45,10 +45,10 @@ class TradeLabel(IntEnum):
 
 
 @dataclass
-class ATRConfig:
-    period: int = 14
-    stop_atr: float = 1.0
-    rr_ratio: float = 1.5  # risk:reward = 1:1.5
+class LabelConfig:
+    """Configuration for Relative Strength label construction."""
+    future_bars: int = 10
+    ratio: float = 1.2  # ratio > 1: require upside/downside to be ratio*other_side to trigger
 
 
 # ==============================
@@ -123,7 +123,7 @@ def add_momentum_and_volatility_features(df: pd.DataFrame, window: int = 14) -> 
     # Volatility: rolling standard deviation of returns
     df["vol_return"] = df["ret_close"].rolling(window).std()
 
-    # ATR (used both as feature and for label construction)
+    # ATR (used as feature for volatility)
     df["atr"] = compute_atr(df, period=window)
 
     return df
@@ -158,144 +158,78 @@ def add_custom_composite_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==============================
-# Label Construction (Fixed)
+# Label Construction: Relative Strength
 # ==============================
 
 
-def build_trade_labels(
+def build_relative_strength_labels(
     df: pd.DataFrame,
-    atr_cfg: ATRConfig,
+    label_cfg: LabelConfig,
     debug: bool = False,
 ) -> pd.Series:
-    """Label each bar t as LONG, SHORT or FLAT.
+    """Label each bar t as LONG, SHORT or FLAT using Relative Strength.
 
-    For each bar t (using price of bar t for entry):
-    - Compute ATR_t
-    - Long: entry at close_t, SL = close_t - ATR_t, TP = close_t + ATR_t * rr
-    - Short: entry at close_t, SL = close_t + ATR_t, TP = close_t - ATR_t * rr
+    For each bar t:
+    - Look at the next `future_bars` K bars
+    - Calculate max upside move from current close: up_move = max(high) - close[t]
+    - Calculate max downside move from current close: down_move = close[t] - min(low)
+    - Compare them with a ratio threshold:
+      - If up_move > down_move * ratio → LONG
+      - If down_move > up_move * ratio → SHORT
+      - Else → FLAT
 
-    We simulate future bars (t+1, t+2, ...) until either TP or SL is hit.
-    Only TP hits result in a label (LONG or SHORT). Bars covered by an open
-    trade are not allowed to open new trades (non-overlapping constraint).
+    This generates much denser labels (40-50% LONG+SHORT) compared to ATR-based labels.
 
     Outcome mapping:
-    - If long TP hit first (before any SL): label LONG at t
-    - If short TP hit first (before any SL): label SHORT at t
-    - Else: FLAT
+    - up_move significantly larger → label LONG at t
+    - down_move significantly larger → label SHORT at t
+    - Otherwise balanced → FLAT
     """
     df = df.copy()
-
-    close = df["close"].values
-    high = df["high"].values
-    low = df["low"].values
-    atr = df["atr"].values
     n = len(df)
+    future_bars = label_cfg.future_bars
+    ratio = label_cfg.ratio
 
     labels = np.full(n, TradeLabel.FLAT, dtype=int)
-    trade_end_indices = np.full(n, -1, dtype=int)
 
-    i = 0
-    debug_count = 0
-    while i < n - 1:
-        # Skip if already covered by previous trade
-        if trade_end_indices[i] > i:
-            i += 1
-            continue
+    for i in range(n - future_bars):
+        entry = df["close"].iloc[i]
 
-        if np.isnan(atr[i]) or atr[i] <= 0:
-            i += 1
-            continue
+        # Look ahead at future bars
+        future_slice = df.iloc[i + 1 : i + 1 + future_bars]
+        future_high = future_slice["high"].max()
+        future_low = future_slice["low"].min()
 
-        entry = close[i]
-        risk = atr_cfg.stop_atr * atr[i]
-        reward = atr_cfg.rr_ratio * risk
+        # Calculate up and down moves
+        up_move = future_high - entry
+        down_move = entry - future_low
 
-        long_sl = entry - risk
-        long_tp = entry + reward
-
-        short_sl = entry + risk
-        short_tp = entry - reward
-
-        # Simulate future path to find TP or SL
-        j = i + 1
-        long_tp_hit = None
-        long_sl_hit = None
-        short_tp_hit = None
-        short_sl_hit = None
-
-        max_lookahead = min(50, n - i - 1)
-
-        while j < i + 1 + max_lookahead:
-            bar_high = high[j]
-            bar_low = low[j]
-
-            # Long: check TP first, then SL (TP takes priority if both in same bar)
-            if long_tp_hit is None and bar_high >= long_tp:
-                long_tp_hit = j
-            elif long_sl_hit is None and bar_low <= long_sl:
-                long_sl_hit = j
-
-            # Short: check TP first, then SL
-            if short_tp_hit is None and bar_low <= short_tp:
-                short_tp_hit = j
-            elif short_sl_hit is None and bar_high >= short_sl:
-                short_sl_hit = j
-
-            # Early exit: both sides have hit something
-            if (long_tp_hit is not None or long_sl_hit is not None) and \
-               (short_tp_hit is not None or short_sl_hit is not None):
-                break
-
-            j += 1
-
-        # Decide label: only label LONG or SHORT if TP is hit before SL
-        outcome = TradeLabel.FLAT
-        trade_close_idx = None
-
-        # Check if long TP hit before long SL
-        long_is_profitable = long_tp_hit is not None and \
-                             (long_sl_hit is None or long_tp_hit <= long_sl_hit)
-
-        # Check if short TP hit before short SL
-        short_is_profitable = short_tp_hit is not None and \
-                              (short_sl_hit is None or short_tp_hit <= short_sl_hit)
-
-        if long_is_profitable and short_is_profitable:
-            # Both are profitable, pick the one that hits first
-            if long_tp_hit <= short_tp_hit:
-                outcome = TradeLabel.LONG
-                trade_close_idx = long_tp_hit
-            else:
-                outcome = TradeLabel.SHORT
-                trade_close_idx = short_tp_hit
-        elif long_is_profitable:
+        # Avoid division by zero
+        if down_move == 0 and up_move > 0:
             outcome = TradeLabel.LONG
-            trade_close_idx = long_tp_hit
-        elif short_is_profitable:
+        elif up_move == 0 and down_move > 0:
             outcome = TradeLabel.SHORT
-            trade_close_idx = short_tp_hit
+        elif down_move == 0 and up_move == 0:
+            outcome = TradeLabel.FLAT
+        else:
+            # Apply ratio threshold
+            if up_move > down_move * ratio:
+                outcome = TradeLabel.LONG
+            elif down_move > up_move * ratio:
+                outcome = TradeLabel.SHORT
+            else:
+                outcome = TradeLabel.FLAT
 
         labels[i] = int(outcome)
 
-        if debug and debug_count < 10 and outcome != TradeLabel.FLAT:
-            print(f"  Bar {i}: entry={entry:.2f}, atr={atr[i]:.2f}, "
-                  f"long_tp={long_tp:.2f} (hit@{long_tp_hit}), "
-                  f"long_sl={long_sl:.2f} (hit@{long_sl_hit}), "
-                  f"short_tp={short_tp:.2f} (hit@{short_tp_hit}), "
-                  f"short_sl={short_sl:.2f} (hit@{short_sl_hit}), "
-                  f"label={TradeLabel(outcome).name}")
-            debug_count += 1
-
-        if outcome == TradeLabel.FLAT:
-            i += 1
-        else:
-            # Mark the range of this trade as covered
-            if trade_close_idx is not None:
-                for idx in range(i, trade_close_idx + 1):
-                    trade_end_indices[idx] = trade_close_idx
-                i = trade_close_idx + 1
-            else:
-                i += 1
+        if debug and i < 10:
+            print(
+                f"  Bar {i}: entry={entry:.2f}, "
+                f"future_high={future_high:.2f}, future_low={future_low:.2f}, "
+                f"up_move={up_move:.2f}, down_move={down_move:.2f}, "
+                f"ratio_check={up_move / (down_move + 1e-8):.2f}, "
+                f"label={TradeLabel(outcome).name}"
+            )
 
     return pd.Series(labels, index=df.index, name="label")
 
@@ -307,12 +241,12 @@ def build_trade_labels(
 
 def build_feature_dataframe(
     df: pd.DataFrame,
-    atr_cfg: ATRConfig,
+    label_cfg: LabelConfig,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """End-to-end feature and label construction for a single symbol/timeframe."""
     print("  Computing momentum and volatility features...")
     df_feat = add_momentum_and_volatility_features(df)
-    
+
     print("  Building custom composite indicators...")
     df_feat = add_custom_composite_indicators(df_feat)
 
@@ -320,9 +254,9 @@ def build_feature_dataframe(
     df_feat = df_feat.dropna().copy()
     print(f"  After dropping NaNs: {len(df_feat)} bars")
 
-    # Build labels
-    print("  Constructing trade labels...")
-    labels = build_trade_labels(df_feat, atr_cfg=atr_cfg, debug=True)
+    # Build labels using Relative Strength
+    print("  Constructing Relative Strength labels...")
+    labels = build_relative_strength_labels(df_feat, label_cfg=label_cfg, debug=True)
 
     # Align and drop rows without labels
     df_feat = df_feat.loc[labels.index]
@@ -333,9 +267,17 @@ def build_feature_dataframe(
     df_feat = df_feat.loc[labels_shifted.index]
 
     feature_cols = [
-        "open", "high", "low", "close", "volume",
-        "ret_close", "mom_return", "vol_return", "atr",
-        "trend_strength", "momentum_vol_score",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "ret_close",
+        "mom_return",
+        "vol_return",
+        "atr",
+        "trend_strength",
+        "momentum_vol_score",
     ]
 
     X = df_feat[feature_cols].copy()
@@ -358,7 +300,7 @@ def train_baseline_model(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifie
 
     print("  Training RandomForest (n_estimators=200, max_depth=8)...")
     start_time = time.time()
-    
+
     model = RandomForestClassifier(
         n_estimators=200,
         max_depth=8,
@@ -368,15 +310,15 @@ def train_baseline_model(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifie
         verbose=1,
     )
     model.fit(X_train, y_train)
-    
+
     elapsed = time.time() - start_time
     print(f"  Training completed in {elapsed:.2f}s")
 
     print("\n  Making predictions on test set...")
     y_pred = model.predict(X_test)
-    
+
     print("\nClassification Report:")
-    print("="*60)
+    print("=" * 60)
     print(
         classification_report(
             y_test,
@@ -390,22 +332,21 @@ def train_baseline_model(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifie
             zero_division=0,
         )
     )
-    
+
     print("\nConfusion Matrix:")
-    print("="*60)
+    print("=" * 60)
     cm = confusion_matrix(y_test, y_pred)
     print(f"           Pred FLAT  Pred LONG  Pred SHORT")
     print(f"Actual FLAT   {cm[0,0]:6d}    {cm[0,1]:6d}     {cm[0,2]:6d}")
     print(f"Actual LONG   {cm[1,0]:6d}    {cm[1,1]:6d}     {cm[1,2]:6d}")
     print(f"Actual SHORT  {cm[2,0]:6d}    {cm[2,1]:6d}     {cm[2,2]:6d}")
-    
+
     print("\nFeature Importance (Top 10):")
-    print("="*60)
-    feature_importance = pd.DataFrame({
-        'feature': X.columns,
-        'importance': model.feature_importances_
-    }).sort_values('importance', ascending=False)
-    
+    print("=" * 60)
+    feature_importance = pd.DataFrame(
+        {"feature": X.columns, "importance": model.feature_importances_}
+    ).sort_values("importance", ascending=False)
+
     for idx, row in feature_importance.head(10).iterrows():
         print(f"{row['feature']:20s}: {row['importance']:.4f}")
 
@@ -424,10 +365,10 @@ def main():
     print(f"Loading data for {symbol} {timeframe}...")
     df = load_klines(symbol, timeframe)
 
-    atr_cfg = ATRConfig(period=14, stop_atr=1.0, rr_ratio=1.5)
+    label_cfg = LabelConfig(future_bars=10, ratio=1.2)
 
     print("\nBuilding features and labels...")
-    X, y = build_feature_dataframe(df, atr_cfg)
+    X, y = build_feature_dataframe(df, label_cfg)
     print(f"\nDataset shape: X={X.shape}, y={y.shape}")
     print(f"Label distribution:\n{y.value_counts().sort_index().to_string()}")
     print(f"Label percentages:")
