@@ -1,15 +1,10 @@
-"""ML training pipeline for System V4 - Optimized Labels & Features.
-
-This script loads OHLCV data from the HuggingFace dataset,
-builds direction-focused features,
-constructs trade labels using ATR-relative approach for universal applicability,
-and trains an XGBoost model.
+"""ML training pipeline for System V4 - Enhanced with Sample Weights & Multi-Timeframe.
 
 Key improvements:
-- ATR-relative labels: Works across all coin types and timeframes
-- Direction-focused features: Momentum, position, K-line structure
-- Reduced noise from pure volatility indicators
-- Feature importance ranking for interpretability
+1. Sample weight for multi-class imbalance handling
+2. SMA_200 for long-term trend context
+3. Multi-timeframe (1h) features for higher-level confirmation
+4. ATR-relative labels universal across coins
 """
 
 from __future__ import annotations
@@ -25,6 +20,7 @@ from huggingface_hub import hf_hub_download
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_sample_weight
 
 try:
     import xgboost as xgb
@@ -57,7 +53,7 @@ class TradeLabel(IntEnum):
 class LabelConfig:
     """Configuration for ATR-relative label construction."""
     future_bars: int = 10
-    atr_multiplier: float = 0.5  # ATR × 0.5 for target threshold
+    atr_multiplier: float = 0.5
 
 
 # ==============================
@@ -134,21 +130,19 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
-def add_direction_focused_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add direction-focused features, minimize noise from pure volatility."""
+def add_direction_focused_features(df: pd.DataFrame, include_sma200: bool = True) -> pd.DataFrame:
+    """Add direction-focused features."""
     df = df.copy()
     
-    # ==================== Momentum Features (Direction Signal) ====================
+    # ==================== Momentum Features ====================
     df["returns"] = df["close"].pct_change()
     df["log_returns"] = np.log(df["close"] / df["close"].shift(1))
     
-    # Past momentum - absolute price change (not %, universal across coins)
     df["past_momentum_3"] = df["close"] - df["close"].shift(3)
     df["past_momentum_5"] = df["close"] - df["close"].shift(5)
     df["past_momentum_10"] = df["close"] - df["close"].shift(10)
     df["past_momentum_20"] = df["close"] - df["close"].shift(20)
     
-    # Normalize past momentum by recent price range
     recent_range = df["high"].rolling(10).max() - df["low"].rolling(10).min()
     df["past_mom_3_norm"] = df["past_momentum_3"] / (recent_range + 1e-8)
     df["past_mom_5_norm"] = df["past_momentum_5"] / (recent_range + 1e-8)
@@ -158,20 +152,23 @@ def add_direction_focused_features(df: pd.DataFrame) -> pd.DataFrame:
     df["sma_10"] = df["close"].rolling(10).mean()
     df["sma_20"] = df["close"].rolling(20).mean()
     df["sma_50"] = df["close"].rolling(50).mean()
+    if include_sma200:
+        df["sma_200"] = df["close"].rolling(200).mean()  # LONG-TERM TREND
+    
     df["ema_12"] = df["close"].ewm(span=12).mean()
     df["ema_26"] = df["close"].ewm(span=26).mean()
     
-    # Trend slopes (direction indicator)
-    df["trend_slope_10"] = (df["close"] - df["close"].shift(10)) / 10  # Average slope over 10 bars
+    df["trend_slope_10"] = (df["close"] - df["close"].shift(10)) / 10
     df["trend_slope_20"] = (df["close"] - df["close"].shift(20)) / 20
-    df["sma_10_20_cross"] = df["sma_10"] - df["sma_20"]  # Crossover signal
+    df["sma_10_20_cross"] = df["sma_10"] - df["sma_20"]
     df["sma_20_50_cross"] = df["sma_20"] - df["sma_50"]
+    if include_sma200:
+        df["sma_50_200_cross"] = df["sma_50"] - df["sma_200"]  # Long-term crossover
     
     # ==================== Momentum Indicators ====================
     df["rsi_14"] = compute_rsi(df, 14)
     df["rsi_7"] = compute_rsi(df, 7)
     
-    # MACD (strong direction signal)
     macd, signal, hist = compute_macd(df)
     df["macd"] = macd
     df["macd_signal"] = signal
@@ -180,18 +177,17 @@ def add_direction_focused_features(df: pd.DataFrame) -> pd.DataFrame:
     # ==================== Position Relative to Recent Range ====================
     high_20 = df["high"].rolling(20).max()
     low_20 = df["low"].rolling(20).min()
-    df["position_in_range_20"] = (df["close"] - low_20) / (high_20 - low_20 + 1e-8)  # 0=at low, 1=at high
+    df["position_in_range_20"] = (df["close"] - low_20) / (high_20 - low_20 + 1e-8)
     
     high_50 = df["high"].rolling(50).max()
     low_50 = df["low"].rolling(50).min()
     df["position_in_range_50"] = (df["close"] - low_50) / (high_50 - low_50 + 1e-8)
     
-    # ==================== K-line Structure (Wick patterns) ====================
+    # ==================== K-line Structure ====================
     df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
     df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
     df["body"] = (df["close"] - df["open"]).abs()
     
-    # Wick ratios (clipped to avoid extremes)
     df["upper_wick_ratio"] = df["upper_wick"] / (df["body"] + 1e-8)
     df["lower_wick_ratio"] = df["lower_wick"] / (df["body"] + 1e-8)
     df["upper_wick_ratio"] = df["upper_wick_ratio"].clip(-2, 2)
@@ -200,18 +196,35 @@ def add_direction_focused_features(df: pd.DataFrame) -> pd.DataFrame:
     # ==================== Volume-Price Relationship ====================
     df["volume_ma_20"] = df["volume"].rolling(20).mean()
     df["volume_ratio"] = df["volume"] / (df["volume_ma_20"] + 1e-8)
-    df["volume_ratio"] = df["volume_ratio"].clip(0.1, 3)  # Clip extremes
+    df["volume_ratio"] = df["volume_ratio"].clip(0.1, 3)
     
-    # Volume and direction relationship
     df["up_volume"] = np.where(df["close"] > df["open"], df["volume"], 0)
     df["down_volume"] = np.where(df["close"] <= df["open"], df["volume"], 0)
     df["up_down_ratio"] = df["up_volume"].rolling(5).sum() / (df["down_volume"].rolling(5).sum() + 1e-8)
     df["up_down_ratio"] = df["up_down_ratio"].clip(0.1, 3)
     
-    # ==================== ATR for label generation (not as feature) ====================
+    # ==================== ATR for label generation ====================
     df["atr"] = compute_atr(df, 14)
     
     return df
+
+
+def add_higher_timeframe_features(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> pd.DataFrame:
+    """Add 1h features as context for 15m predictions."""
+    df_15m = df_15m.copy()
+    
+    # Resample 1h data to align with 15m index
+    df_1h_resampled = df_1h.reindex(df_15m.index, method='ffill')
+    
+    # Add 1h trend context
+    df_15m["sma_20_1h"] = df_1h_resampled["sma_20"]
+    df_15m["sma_50_1h"] = df_1h_resampled["sma_50"]
+    df_15m["sma_200_1h"] = df_1h_resampled["sma_200"]
+    df_15m["rsi_14_1h"] = df_1h_resampled["rsi_14"]
+    df_15m["macd_hist_1h"] = df_1h_resampled["macd_hist"]
+    df_15m["trend_slope_20_1h"] = df_1h_resampled["trend_slope_20"]
+    
+    return df_15m
 
 
 # ==============================
@@ -223,13 +236,7 @@ def build_atr_relative_labels(
     df: pd.DataFrame,
     label_cfg: LabelConfig,
 ) -> pd.Series:
-    """Label each bar using ATR-relative thresholds.
-    
-    This approach is universal across all coin types and timeframes.
-    - LONG:  future_close > entry + (ATR * multiplier)
-    - SHORT: future_close < entry - (ATR * multiplier)
-    - FLAT:  everything else
-    """
+    """Label each bar using ATR-relative thresholds."""
     df = df.copy()
     n = len(df)
     future_bars = label_cfg.future_bars
@@ -245,19 +252,14 @@ def build_atr_relative_labels(
             labels[i] = TradeLabel.FLAT
             continue
         
-        # Target thresholds
         long_target = entry + (atr_val * atr_mult)
         short_target = entry - (atr_val * atr_mult)
         
-        # Check future bars
         future_slice = df.iloc[i + 1 : i + 1 + future_bars]
         future_high = future_slice["high"].max()
         future_low = future_slice["low"].min()
         
-        # Label based on which target is hit first
         if future_high >= long_target and future_low <= short_target:
-            # Both hit - take which comes first
-            # For now, use the magnitude
             up_dist = future_high - entry
             down_dist = entry - future_low
             labels[i] = TradeLabel.LONG if up_dist > down_dist else TradeLabel.SHORT
@@ -277,12 +279,16 @@ def build_atr_relative_labels(
 
 
 def build_feature_dataframe(
-    df: pd.DataFrame,
+    df_15m: pd.DataFrame,
+    df_1h: pd.DataFrame,
     label_cfg: LabelConfig,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """End-to-end feature and label construction."""
-    print("  Adding direction-focused indicators...")
-    df_feat = add_direction_focused_features(df)
+    print("  Adding 15m direction-focused indicators...")
+    df_feat = add_direction_focused_features(df_15m, include_sma200=True)
+    
+    print("  Adding 1h context features...")
+    df_feat = add_higher_timeframe_features(df_feat, df_1h)
     
     df_feat = df_feat.dropna().copy()
     print(f"  After dropping NaNs: {len(df_feat)} bars")
@@ -290,30 +296,33 @@ def build_feature_dataframe(
     print("  Constructing ATR-relative labels...")
     labels = build_atr_relative_labels(df_feat, label_cfg=label_cfg)
     
-    # Align features and labels
     df_feat = df_feat.loc[labels.index].copy()
     labels = labels.loc[df_feat.index]
     
-    # Select direction-focused features only
+    # Select direction-focused features
     feature_cols = [
-        # Momentum
+        # 15m Momentum
         "returns", "log_returns",
         "past_momentum_3", "past_momentum_5", "past_momentum_10", "past_momentum_20",
         "past_mom_3_norm", "past_mom_5_norm", "past_mom_10_norm",
-        # Trend
-        "sma_10", "sma_20", "sma_50",
+        # 15m Trend
+        "sma_10", "sma_20", "sma_50", "sma_200",
         "ema_12", "ema_26",
         "trend_slope_10", "trend_slope_20",
-        "sma_10_20_cross", "sma_20_50_cross",
-        # Momentum indicators
+        "sma_10_20_cross", "sma_20_50_cross", "sma_50_200_cross",
+        # 15m Momentum Indicators
         "rsi_14", "rsi_7",
         "macd", "macd_signal", "macd_hist",
-        # Position
+        # 15m Position & Structure
         "position_in_range_20", "position_in_range_50",
-        # K-line structure
-        "upper_wick_ratio", "lower_wick_ratio", "body",
-        # Volume
+        "upper_wick_ratio", "lower_wick_ratio",
+        # 15m Volume
         "volume_ratio", "up_down_ratio",
+        # 1h Context (Higher Timeframe)
+        "sma_20_1h", "sma_50_1h", "sma_200_1h",
+        "rsi_14_1h",
+        "macd_hist_1h",
+        "trend_slope_20_1h",
     ]
     
     X = df_feat[feature_cols].copy()
@@ -322,12 +331,12 @@ def build_feature_dataframe(
 
 
 # ==============================
-# Model Training
+# Model Training with Sample Weights
 # ==============================
 
 
 def train_xgboost(X: pd.DataFrame, y: pd.Series):
-    """Train XGBoost with optimized hyperparameters."""
+    """Train XGBoost with sample weights for multi-class imbalance."""
     print("\n" + "="*70)
     print("SPLITTING DATA")
     print("="*70)
@@ -353,8 +362,13 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
+    # Calculate sample weights for multi-class imbalance
+    print("\n  Computing sample weights for multi-class handling...")
+    sample_weights_train = compute_sample_weight('balanced', y_train)
+    print(f"  Sample weight range: [{sample_weights_train.min():.3f}, {sample_weights_train.max():.3f}]")
+    
     print("\n" + "="*70)
-    print("TRAINING XGBoost")
+    print("TRAINING XGBoost (with sample weights + SMA_200 + 1h context)")
     print("="*70)
     
     # Optimized hyperparameters
@@ -373,7 +387,7 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     
     start_time = time.time()
     print("\n  Training...")
-    model.fit(X_train_scaled, y_train)
+    model.fit(X_train_scaled, y_train, sample_weight=sample_weights_train)
     elapsed = time.time() - start_time
     print(f"  Training completed in {elapsed:.2f}s")
     
@@ -422,7 +436,7 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
         {"feature": X.columns, "importance": model.feature_importances_}
     ).sort_values("importance", ascending=False)
     for idx, row in feature_importance.head(20).iterrows():
-        print(f"  {row['feature']:25s}: {row['importance']:.4f}")
+        print(f"  {row['feature']:30s}: {row['importance']:.4f}")
     
     return model, accuracy, f1_macro, f1_weighted
 
@@ -434,14 +448,17 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
 
 def main():
     symbol = "BTCUSDT"
-    timeframe = "15m"
     
-    print(f"Loading data for {symbol} {timeframe}...")
-    df = load_klines(symbol, timeframe)
+    print(f"Loading data for {symbol}...")
+    print("\n  Loading 15m data...")
+    df_15m = load_klines(symbol, "15m")
+    
+    print("\n  Loading 1h data (for context)...")
+    df_1h = load_klines(symbol, "1h")
     
     print("\nBuilding features and labels...")
     label_cfg = LabelConfig(future_bars=10, atr_multiplier=0.5)
-    X, y = build_feature_dataframe(df, label_cfg)
+    X, y = build_feature_dataframe(df_15m, df_1h, label_cfg)
     print(f"\nDataset shape: X={X.shape}, y={y.shape}")
     print(f"Label distribution (ATR-relative, universal):")
     for label_val in [0, 1, 2]:
