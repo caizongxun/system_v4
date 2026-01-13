@@ -5,6 +5,7 @@ Key improvements:
 2. SMA_200 for long-term trend context
 3. Multi-timeframe (1h) features for higher-level confirmation
 4. ATR-relative labels universal across coins
+
 """
 
 from __future__ import annotations
@@ -213,8 +214,12 @@ def add_higher_timeframe_features(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> 
     """Add 1h features as context for 15m predictions."""
     df_15m = df_15m.copy()
     
-    # Resample 1h data to align with 15m index
-    df_1h_resampled = df_1h.reindex(df_15m.index, method='ffill')
+    # 1h 資料也需要先計算特徵
+    print("  Computing 1h features...")
+    df_1h_feat = add_direction_focused_features(df_1h, include_sma200=True)
+    
+    # Resample 1h data to align with 15m index (forward fill 因為 1h bar 涵蓋整個小時)
+    df_1h_resampled = df_1h_feat.reindex(df_15m.index, method='ffill')
     
     # Add 1h trend context
     df_15m["sma_20_1h"] = df_1h_resampled["sma_20"]
