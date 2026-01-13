@@ -1,7 +1,7 @@
 """Configuration management for System V4."""
 
 from typing import Dict, Any
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 import os
 
 
