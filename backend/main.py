@@ -15,6 +15,8 @@ from typing import Dict, List, Optional
 import asyncio
 import threading
 import time
+import numpy as np
+import pandas as pd
 
 from config import settings, IndicatorConfiguration
 from data_loader import KLineDataLoader
@@ -45,6 +47,40 @@ app.add_middleware(
 
 # Global indicator configuration
 user_indicator_config = IndicatorConfiguration()
+
+
+# ============== Helper Functions ==============
+
+def clean_json_value(value):
+    """
+    Convert numpy/pandas values to JSON-safe format.
+    Handles NaN, Inf, and other special values.
+    """
+    if pd.isna(value):
+        return None
+    elif isinstance(value, (np.inf, float)) and np.isinf(value):
+        return None
+    elif isinstance(value, (np.integer, np.floating)):
+        return float(value)
+    elif isinstance(value, (int, float)):
+        return value
+    else:
+        return str(value)
+
+
+def clean_dict_for_json(data: Dict) -> Dict:
+    """
+    Recursively clean dictionary for JSON serialization.
+    Handles nested dictionaries and lists.
+    """
+    if isinstance(data, dict):
+        return {k: clean_dict_for_json(v) for k, v in data.items()}
+    elif isinstance(data, (list, tuple)):
+        return [clean_dict_for_json(item) for item in data]
+    elif isinstance(data, pd.Timestamp):
+        return data.isoformat()
+    else:
+        return clean_json_value(data)
 
 
 # ============== REST API Endpoints ==============
@@ -130,6 +166,11 @@ async def get_klines(
         
         indicator_results = pipeline.calculate(klines)
         
+        # Extract K-line data and clean for JSON
+        klines_subset = klines[['open', 'high', 'low', 'close', 'volume']].tail(limit)
+        klines_dict = klines_subset.to_dict(orient='index')
+        klines_dict = clean_dict_for_json(klines_dict)
+        
         # Build response
         response_data = {
             "symbol": symbol,
@@ -137,7 +178,7 @@ async def get_klines(
             "data_points": len(klines),
             "timestamp_start": klines.index[0].isoformat() if len(klines) > 0 else None,
             "timestamp_end": klines.index[-1].isoformat() if len(klines) > 0 else None,
-            "klines": klines[['open', 'high', 'low', 'close', 'volume']].tail(limit).to_dict(orient='index'),
+            "klines": klines_dict,
             "indicators": {}
         }
         
@@ -147,7 +188,9 @@ async def get_klines(
                 response_data["indicators"][indicator_name] = {"error": result["error"]}
             else:
                 indicator_values = result["values"].tail(limit)
-                response_data["indicators"][indicator_name] = indicator_values.to_dict(orient='index')
+                indicator_dict = indicator_values.to_dict(orient='index')
+                indicator_dict = clean_dict_for_json(indicator_dict)
+                response_data["indicators"][indicator_name] = indicator_dict
         
         return response_data
         
@@ -219,8 +262,8 @@ async def get_signals(
                 {
                     "timestamp": sig.timestamp.isoformat(),
                     "signal_type": sig.signal_type,
-                    "value": sig.value,
-                    "confidence": sig.confidence,
+                    "value": clean_json_value(sig.value),
+                    "confidence": clean_json_value(sig.confidence),
                     "metadata": sig.metadata
                 }
                 for sig in signals
@@ -299,10 +342,13 @@ async def websocket_chart(
                     klines = KLineDataLoader.load_klines(symbol, timeframe)
                     latest = klines.tail(1)
                     
+                    latest_data = latest[['open', 'high', 'low', 'close', 'volume']].to_dict(orient='index')
+                    latest_data = clean_dict_for_json(latest_data)
+                    
                     response = {
                         "symbol": symbol,
                         "timeframe": timeframe,
-                        "latest_candle": latest[['open', 'high', 'low', 'close', 'volume']].to_dict(orient='index')
+                        "latest_candle": latest_data
                     }
                     
                     await websocket.send_json(response)
