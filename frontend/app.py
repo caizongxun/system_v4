@@ -101,9 +101,9 @@ class InteractiveChartWidget(FigureCanvas):
         self.x_data = None
         self.y_data = None
         
-        # Connect events
-        self.mpl_connect('press_event', self.on_press)
-        self.mpl_connect('release_event', self.on_release)
+        # Connect events - use correct matplotlib event names
+        self.mpl_connect('button_press_event', self.on_press)
+        self.mpl_connect('button_release_event', self.on_release)
         self.mpl_connect('motion_notify_event', self.on_motion)
         self.mpl_connect('scroll_event', self.on_scroll)
         self.mpl_connect('figure_leave_event', self.on_leave)
@@ -134,17 +134,16 @@ class InteractiveChartWidget(FigureCanvas):
         self._update_crosshair(event.xdata, event.ydata)
         
         # Pan (middle mouse button or right click)
-        if self.press is not None:
+        if self.press is not None and event.button == 2:
             dx = event.xdata - self.press[0]
             dy = event.ydata - self.press[1]
             
-            if event.button == 2:  # Middle mouse button
-                new_xlim = [self.cur_xlim[0] - dx, self.cur_xlim[1] - dx]
-                new_ylim = [self.cur_ylim[0] - dy, self.cur_ylim[1] - dy]
-                
-                self.axes.set_xlim(new_xlim)
-                self.axes.set_ylim(new_ylim)
-                self.draw_idle()
+            new_xlim = [self.cur_xlim[0] - dx, self.cur_xlim[1] - dx]
+            new_ylim = [self.cur_ylim[0] - dy, self.cur_ylim[1] - dy]
+            
+            self.axes.set_xlim(new_xlim)
+            self.axes.set_ylim(new_ylim)
+            self.draw_idle()
     
     def on_scroll(self, event):
         """Mouse scroll event - for zooming."""
@@ -436,18 +435,38 @@ class System_V4_App(QMainWindow):
         self.tab_widget = QTabWidget()
         
         # Price chart
+        price_chart_layout = QVBoxLayout()
         self.price_chart = InteractiveChartWidget()
-        self.tab_widget.addTab(self.price_chart, 'Price Chart')
+        price_chart_layout.addWidget(self.price_chart.toolbar)
+        price_chart_layout.addWidget(self.price_chart)
+        price_chart_widget = QWidget()
+        price_chart_widget.setLayout(price_chart_layout)
+        self.tab_widget.addTab(price_chart_widget, 'Price Chart')
         
         # Indicator charts
+        macd_layout = QVBoxLayout()
         self.macd_chart = InteractiveChartWidget()
-        self.tab_widget.addTab(self.macd_chart, 'MACD')
+        macd_layout.addWidget(self.macd_chart.toolbar)
+        macd_layout.addWidget(self.macd_chart)
+        macd_widget = QWidget()
+        macd_widget.setLayout(macd_layout)
+        self.tab_widget.addTab(macd_widget, 'MACD')
         
+        rsi_layout = QVBoxLayout()
         self.rsi_chart = InteractiveChartWidget()
-        self.tab_widget.addTab(self.rsi_chart, 'RSI')
+        rsi_layout.addWidget(self.rsi_chart.toolbar)
+        rsi_layout.addWidget(self.rsi_chart)
+        rsi_widget = QWidget()
+        rsi_widget.setLayout(rsi_layout)
+        self.tab_widget.addTab(rsi_widget, 'RSI')
         
+        bb_layout = QVBoxLayout()
         self.bb_chart = InteractiveChartWidget()
-        self.tab_widget.addTab(self.bb_chart, 'Bollinger Bands')
+        bb_layout.addWidget(self.bb_chart.toolbar)
+        bb_layout.addWidget(self.bb_chart)
+        bb_widget = QWidget()
+        bb_widget.setLayout(bb_layout)
+        self.tab_widget.addTab(bb_widget, 'Bollinger Bands')
         
         main_layout.addWidget(self.tab_widget)
         
