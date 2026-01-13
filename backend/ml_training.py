@@ -1,15 +1,15 @@
-"""ML training pipeline for System V4 - Balanced Label Strategy.
+"""ML training pipeline for System V4 - Optimized Labels & Features.
 
 This script loads OHLCV data from the HuggingFace dataset,
-builds engineered features with technical indicators,
-constructs trade labels using quantile-based approach for class balance,
-and trains an XGBoost model to achieve 70%+ accuracy.
+builds direction-focused features,
+constructs trade labels using ATR-relative approach for universal applicability,
+and trains an XGBoost model.
 
 Key improvements:
-- Quantile-based label generation for balanced classes
-- Technical indicators: RSI, MACD, Bollinger Bands, ATR
-- Class weight balancing in XGBoost
-- Strategic hyperparameter tuning
+- ATR-relative labels: Works across all coin types and timeframes
+- Direction-focused features: Momentum, position, K-line structure
+- Reduced noise from pure volatility indicators
+- Feature importance ranking for interpretability
 """
 
 from __future__ import annotations
@@ -55,8 +55,9 @@ class TradeLabel(IntEnum):
 
 @dataclass
 class LabelConfig:
-    """Configuration for label construction."""
+    """Configuration for ATR-relative label construction."""
     future_bars: int = 10
+    atr_multiplier: float = 0.5  # ATR × 0.5 for target threshold
 
 
 # ==============================
@@ -94,7 +95,7 @@ def load_klines(symbol: str, timeframe: str) -> pd.DataFrame:
 
 
 # ==============================
-# Technical Indicators
+# Technical Indicators - Direction Focused
 # ==============================
 
 
@@ -118,15 +119,6 @@ def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int =
     return macd_line, signal_line, histogram
 
 
-def compute_bollinger_bands(df: pd.DataFrame, period: int = 20, std_dev: float = 2.0):
-    """Compute Bollinger Bands."""
-    sma = df["close"].rolling(period).mean()
-    std = df["close"].rolling(period).std()
-    upper = sma + (std * std_dev)
-    lower = sma - (std * std_dev)
-    return upper, sma, lower
-
-
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Compute Average True Range (ATR)."""
     high = df["high"]
@@ -142,98 +134,141 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
-def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add all technical indicators."""
+def add_direction_focused_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add direction-focused features, minimize noise from pure volatility."""
     df = df.copy()
     
-    # Basic features
+    # ==================== Momentum Features (Direction Signal) ====================
     df["returns"] = df["close"].pct_change()
     df["log_returns"] = np.log(df["close"] / df["close"].shift(1))
-    df["price_range"] = (df["high"] - df["low"]) / df["close"]
-    df["close_position"] = (df["close"] - df["low"]) / (df["high"] - df["low"] + 1e-8)
     
-    # Momentum indicators
-    df["rsi_14"] = compute_rsi(df, 14)
-    df["rsi_7"] = compute_rsi(df, 7)
-    df["momentum_10"] = df["close"] - df["close"].shift(10)
-    df["momentum_20"] = df["close"] - df["close"].shift(20)
+    # Past momentum - absolute price change (not %, universal across coins)
+    df["past_momentum_3"] = df["close"] - df["close"].shift(3)
+    df["past_momentum_5"] = df["close"] - df["close"].shift(5)
+    df["past_momentum_10"] = df["close"] - df["close"].shift(10)
+    df["past_momentum_20"] = df["close"] - df["close"].shift(20)
     
-    # MACD
-    macd, signal, hist = compute_macd(df)
-    df["macd"] = macd
-    df["macd_signal"] = signal
-    df["macd_hist"] = hist
+    # Normalize past momentum by recent price range
+    recent_range = df["high"].rolling(10).max() - df["low"].rolling(10).min()
+    df["past_mom_3_norm"] = df["past_momentum_3"] / (recent_range + 1e-8)
+    df["past_mom_5_norm"] = df["past_momentum_5"] / (recent_range + 1e-8)
+    df["past_mom_10_norm"] = df["past_momentum_10"] / (recent_range + 1e-8)
     
-    # Bollinger Bands
-    upper, middle, lower = compute_bollinger_bands(df)
-    df["bb_upper"] = upper
-    df["bb_middle"] = middle
-    df["bb_lower"] = lower
-    df["bb_position"] = (df["close"] - lower) / (upper - lower + 1e-8)
-    df["bb_width"] = (upper - lower) / middle
-    
-    # ATR
-    df["atr"] = compute_atr(df, 14)
-    df["atr_normalized"] = df["atr"] / df["close"]
-    
-    # Volume
-    df["volume_ma_20"] = df["volume"].rolling(20).mean()
-    df["volume_ratio"] = df["volume"] / (df["volume_ma_20"] + 1e-8)
-    
-    # Moving averages
+    # ==================== Trend Features ====================
     df["sma_10"] = df["close"].rolling(10).mean()
     df["sma_20"] = df["close"].rolling(20).mean()
     df["sma_50"] = df["close"].rolling(50).mean()
     df["ema_12"] = df["close"].ewm(span=12).mean()
     df["ema_26"] = df["close"].ewm(span=26).mean()
     
-    # Trend
-    df["trend_10"] = (df["sma_10"] - df["sma_20"]) / df["close"]
-    df["trend_20"] = (df["sma_20"] - df["sma_50"]) / df["close"]
+    # Trend slopes (direction indicator)
+    df["trend_slope_10"] = (df["close"] - df["close"].shift(10)) / 10  # Average slope over 10 bars
+    df["trend_slope_20"] = (df["close"] - df["close"].shift(20)) / 20
+    df["sma_10_20_cross"] = df["sma_10"] - df["sma_20"]  # Crossover signal
+    df["sma_20_50_cross"] = df["sma_20"] - df["sma_50"]
     
-    # Volatility
-    df["volatility_10"] = df["returns"].rolling(10).std()
-    df["volatility_20"] = df["returns"].rolling(20).std()
+    # ==================== Momentum Indicators ====================
+    df["rsi_14"] = compute_rsi(df, 14)
+    df["rsi_7"] = compute_rsi(df, 7)
+    
+    # MACD (strong direction signal)
+    macd, signal, hist = compute_macd(df)
+    df["macd"] = macd
+    df["macd_signal"] = signal
+    df["macd_hist"] = hist
+    
+    # ==================== Position Relative to Recent Range ====================
+    high_20 = df["high"].rolling(20).max()
+    low_20 = df["low"].rolling(20).min()
+    df["position_in_range_20"] = (df["close"] - low_20) / (high_20 - low_20 + 1e-8)  # 0=at low, 1=at high
+    
+    high_50 = df["high"].rolling(50).max()
+    low_50 = df["low"].rolling(50).min()
+    df["position_in_range_50"] = (df["close"] - low_50) / (high_50 - low_50 + 1e-8)
+    
+    # ==================== K-line Structure (Wick patterns) ====================
+    df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
+    df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
+    df["body"] = (df["close"] - df["open"]).abs()
+    
+    # Wick ratios (clipped to avoid extremes)
+    df["upper_wick_ratio"] = df["upper_wick"] / (df["body"] + 1e-8)
+    df["lower_wick_ratio"] = df["lower_wick"] / (df["body"] + 1e-8)
+    df["upper_wick_ratio"] = df["upper_wick_ratio"].clip(-2, 2)
+    df["lower_wick_ratio"] = df["lower_wick_ratio"].clip(-2, 2)
+    
+    # ==================== Volume-Price Relationship ====================
+    df["volume_ma_20"] = df["volume"].rolling(20).mean()
+    df["volume_ratio"] = df["volume"] / (df["volume_ma_20"] + 1e-8)
+    df["volume_ratio"] = df["volume_ratio"].clip(0.1, 3)  # Clip extremes
+    
+    # Volume and direction relationship
+    df["up_volume"] = np.where(df["close"] > df["open"], df["volume"], 0)
+    df["down_volume"] = np.where(df["close"] <= df["open"], df["volume"], 0)
+    df["up_down_ratio"] = df["up_volume"].rolling(5).sum() / (df["down_volume"].rolling(5).sum() + 1e-8)
+    df["up_down_ratio"] = df["up_down_ratio"].clip(0.1, 3)
+    
+    # ==================== ATR for label generation (not as feature) ====================
+    df["atr"] = compute_atr(df, 14)
     
     return df
 
 
 # ==============================
-# Label Construction - Quantile-Based
+# Label Construction - ATR Relative
 # ==============================
 
 
-def build_quantile_labels(
+def build_atr_relative_labels(
     df: pd.DataFrame,
     label_cfg: LabelConfig,
 ) -> pd.Series:
-    """Label each bar using future returns (top 33% = LONG, bottom 33% = SHORT, middle = FLAT).
+    """Label each bar using ATR-relative thresholds.
     
-    This ensures balanced class distribution automatically.
+    This approach is universal across all coin types and timeframes.
+    - LONG:  future_close > entry + (ATR * multiplier)
+    - SHORT: future_close < entry - (ATR * multiplier)
+    - FLAT:  everything else
     """
     df = df.copy()
     n = len(df)
     future_bars = label_cfg.future_bars
+    atr_mult = label_cfg.atr_multiplier
     
-    future_returns = []
+    labels = np.full(n, TradeLabel.FLAT, dtype=int)
     
     for i in range(n - future_bars):
         entry = df["close"].iloc[i]
-        future_close = df["close"].iloc[i + future_bars]
-        ret = (future_close - entry) / entry
-        future_returns.append(ret)
+        atr_val = df["atr"].iloc[i]
+        
+        if pd.isna(atr_val) or atr_val == 0:
+            labels[i] = TradeLabel.FLAT
+            continue
+        
+        # Target thresholds
+        long_target = entry + (atr_val * atr_mult)
+        short_target = entry - (atr_val * atr_mult)
+        
+        # Check future bars
+        future_slice = df.iloc[i + 1 : i + 1 + future_bars]
+        future_high = future_slice["high"].max()
+        future_low = future_slice["low"].min()
+        
+        # Label based on which target is hit first
+        if future_high >= long_target and future_low <= short_target:
+            # Both hit - take which comes first
+            # For now, use the magnitude
+            up_dist = future_high - entry
+            down_dist = entry - future_low
+            labels[i] = TradeLabel.LONG if up_dist > down_dist else TradeLabel.SHORT
+        elif future_high >= long_target:
+            labels[i] = TradeLabel.LONG
+        elif future_low <= short_target:
+            labels[i] = TradeLabel.SHORT
+        else:
+            labels[i] = TradeLabel.FLAT
     
-    future_returns = np.array(future_returns)
-    
-    # Quantile-based labeling for class balance
-    q33 = np.percentile(future_returns, 33.33)
-    q67 = np.percentile(future_returns, 66.67)
-    
-    labels = np.full(len(future_returns), TradeLabel.FLAT, dtype=int)
-    labels[future_returns <= q33] = TradeLabel.SHORT
-    labels[future_returns >= q67] = TradeLabel.LONG
-    
-    return pd.Series(labels, index=df.index[:len(future_returns)], name="label")
+    return pd.Series(labels, index=df.index, name="label")
 
 
 # ==============================
@@ -246,31 +281,39 @@ def build_feature_dataframe(
     label_cfg: LabelConfig,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """End-to-end feature and label construction."""
-    print("  Adding technical indicators...")
-    df_feat = add_technical_indicators(df)
+    print("  Adding direction-focused indicators...")
+    df_feat = add_direction_focused_features(df)
     
     df_feat = df_feat.dropna().copy()
     print(f"  After dropping NaNs: {len(df_feat)} bars")
     
-    print("  Constructing quantile-based labels...")
-    labels = build_quantile_labels(df_feat, label_cfg=label_cfg)
+    print("  Constructing ATR-relative labels...")
+    labels = build_atr_relative_labels(df_feat, label_cfg=label_cfg)
     
     # Align features and labels
     df_feat = df_feat.loc[labels.index].copy()
     labels = labels.loc[df_feat.index]
     
-    # Select best features
+    # Select direction-focused features only
     feature_cols = [
-        "rsi_14", "rsi_7", "momentum_10", "momentum_20",
-        "macd", "macd_signal", "macd_hist",
-        "bb_position", "bb_width",
-        "atr_normalized",
-        "volume_ratio",
-        "sma_10", "sma_20", "sma_50", "ema_12", "ema_26",
-        "trend_10", "trend_20",
-        "volatility_10", "volatility_20",
+        # Momentum
         "returns", "log_returns",
-        "price_range", "close_position",
+        "past_momentum_3", "past_momentum_5", "past_momentum_10", "past_momentum_20",
+        "past_mom_3_norm", "past_mom_5_norm", "past_mom_10_norm",
+        # Trend
+        "sma_10", "sma_20", "sma_50",
+        "ema_12", "ema_26",
+        "trend_slope_10", "trend_slope_20",
+        "sma_10_20_cross", "sma_20_50_cross",
+        # Momentum indicators
+        "rsi_14", "rsi_7",
+        "macd", "macd_signal", "macd_hist",
+        # Position
+        "position_in_range_20", "position_in_range_50",
+        # K-line structure
+        "upper_wick_ratio", "lower_wick_ratio", "body",
+        # Volume
+        "volume_ratio", "up_down_ratio",
     ]
     
     X = df_feat[feature_cols].copy()
@@ -284,7 +327,7 @@ def build_feature_dataframe(
 
 
 def train_xgboost(X: pd.DataFrame, y: pd.Series):
-    """Train XGBoost with class weight balancing."""
+    """Train XGBoost with optimized hyperparameters."""
     print("\n" + "="*70)
     print("SPLITTING DATA")
     print("="*70)
@@ -314,11 +357,11 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     print("TRAINING XGBoost")
     print("="*70)
     
-    # Balanced hyperparameters
+    # Optimized hyperparameters
     model = xgb.XGBClassifier(
         n_estimators=300,
-        max_depth=7,
-        learning_rate=0.08,
+        max_depth=6,
+        learning_rate=0.1,
         subsample=0.85,
         colsample_bytree=0.85,
         gamma=0.5,
@@ -374,12 +417,12 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     print(f"Actual FLAT    {cm[1,0]:6d}    {cm[1,1]:6d}    {cm[1,2]:6d}")
     print(f"Actual LONG    {cm[2,0]:6d}    {cm[2,1]:6d}    {cm[2,2]:6d}")
     
-    print(f"\nFeature Importance (Top 15):")
+    print(f"\nFeature Importance (Top 20):")
     feature_importance = pd.DataFrame(
         {"feature": X.columns, "importance": model.feature_importances_}
     ).sort_values("importance", ascending=False)
-    for idx, row in feature_importance.head(15).iterrows():
-        print(f"  {row['feature']:20s}: {row['importance']:.4f}")
+    for idx, row in feature_importance.head(20).iterrows():
+        print(f"  {row['feature']:25s}: {row['importance']:.4f}")
     
     return model, accuracy, f1_macro, f1_weighted
 
@@ -397,10 +440,10 @@ def main():
     df = load_klines(symbol, timeframe)
     
     print("\nBuilding features and labels...")
-    label_cfg = LabelConfig(future_bars=10)
+    label_cfg = LabelConfig(future_bars=10, atr_multiplier=0.5)
     X, y = build_feature_dataframe(df, label_cfg)
     print(f"\nDataset shape: X={X.shape}, y={y.shape}")
-    print(f"Label distribution (quantile-based - balanced):")
+    print(f"Label distribution (ATR-relative, universal):")
     for label_val in [0, 1, 2]:
         count = (y == label_val).sum()
         pct = count / len(y) * 100
