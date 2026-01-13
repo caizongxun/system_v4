@@ -267,28 +267,22 @@ def train_optimized_xgboost(X: pd.DataFrame, y: pd.Series):
 
     # Optimized hyperparameters
     model = xgb.XGBClassifier(
-        n_estimators=400,          # More trees
-        max_depth=5,               # Shallower trees, less overfitting
-        learning_rate=0.05,        # Slower learning, more stable
-        subsample=0.8,             # Stochastic boosting
-        colsample_bytree=0.8,      # Feature subsampling
-        gamma=1,                   # Regularization
-        min_child_weight=5,        # Prevent overfitting
-        scale_pos_weight=scale_pos_weight,  # Balance classes
+        n_estimators=400,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        gamma=1,
+        min_child_weight=5,
+        scale_pos_weight=scale_pos_weight,
         random_state=42,
         n_jobs=-1,
-        verbosity=1,
+        verbosity=0,
     )
 
     start_time = time.time()
     print("\n  Training...")
-    model.fit(
-        X_train_scaled,
-        y_train,
-        eval_set=[(X_test_scaled, y_test)],
-        early_stopping_rounds=50,
-        verbose=False,
-    )
+    model.fit(X_train_scaled, y_train)
     elapsed = time.time() - start_time
     print(f"  Training completed in {elapsed:.2f}s")
 
@@ -310,9 +304,9 @@ def train_optimized_xgboost(X: pd.DataFrame, y: pd.Series):
     print(f"F1-Score (Weighted): {f1_weighted:.4f}")
 
     if accuracy >= 0.70:
-        print(f"\n✓ TARGET ACHIEVED: {accuracy*100:.2f}% >= 70%")
+        print(f"\nTARGET ACHIEVED: {accuracy*100:.2f}% >= 70%")
     else:
-        print(f"\n✗ Target not reached: {accuracy*100:.2f}% < 70%")
+        print(f"\nTarget not reached: {accuracy*100:.2f}% < 70%")
         print(f"  Need {(0.70 - accuracy)*100:.2f}% more improvement")
 
     print(f"\nClassification Report:")
