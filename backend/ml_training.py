@@ -3,7 +3,7 @@
 This script loads OHLCV data from the HuggingFace dataset
 `zongowo111/v2-crypto-ohlcv-data`, builds engineered features
 (momentum, volatility and custom composite indicators),
-constructs trade labels based on ATR stop loss and 1:1.5 risk-reward,
+onstructs trade labels based on ATR stop loss and 1:1.5 risk-reward,
 then trains a baseline model to predict whether to enter long, short or stay flat
 on the next bar given the last fully closed bar.
 
@@ -338,14 +338,16 @@ def train_baseline_model(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifie
         classification_report(
             y_test,
             y_pred,
+            labels=[int(TradeLabel.FLAT), int(TradeLabel.LONG), int(TradeLabel.SHORT)],
             target_names=[
                 TradeLabel.FLAT.name,
                 TradeLabel.LONG.name,
                 TradeLabel.SHORT.name,
             ],
+            zero_division=0,
         )
     )
-    print("Confusion matrix:")
+    print("\nConfusion matrix:")
     print(confusion_matrix(y_test, y_pred))
 
     return model
@@ -368,8 +370,9 @@ def main():
     print("Building features and labels...")
     X, y = build_feature_dataframe(df, atr_cfg)
     print(f"Dataset shape: X={X.shape}, y={y.shape}")
+    print(f"Label distribution: {y.value_counts().to_dict()}")
 
-    print("Training baseline model...")
+    print("\nTraining baseline model...")
     _ = train_baseline_model(X, y)
 
 
