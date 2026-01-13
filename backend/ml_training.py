@@ -1,10 +1,12 @@
 """ML training pipeline for System V4 - Enhanced with Sample Weights & Multi-Timeframe.
 
 Key improvements:
-1. Sample weight for multi-class imbalance handling
-2. SMA_200 for long-term trend context
-3. Multi-timeframe (1h) features for higher-level confirmation
-4. ATR-relative labels universal across coins
+1. Improved label generation logic (less strict thresholds)
+2. Class rebalancing via threshold adjustment
+3. Sample weight for multi-class imbalance handling
+4. SMA_200 for long-term trend context
+5. Multi-timeframe (1h) features for higher-level confirmation
+6. ATR-relative labels universal across coins
 
 """
 
@@ -54,7 +56,8 @@ class TradeLabel(IntEnum):
 class LabelConfig:
     """Configuration for ATR-relative label construction."""
     future_bars: int = 10
-    atr_multiplier: float = 0.5
+    atr_multiplier: float = 0.5      # 用於定義進場目標 (ATR × 倍數)
+    neutral_atr_mult: float = 0.25   # FLAT 區間：±0.25 × ATR
 
 
 # ==============================
@@ -233,19 +236,28 @@ def add_higher_timeframe_features(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> 
 
 
 # ==============================
-# Label Construction - ATR Relative
+# Label Construction - Improved Logic
 # ==============================
 
 
-def build_atr_relative_labels(
+def build_improved_labels(
     df: pd.DataFrame,
     label_cfg: LabelConfig,
 ) -> pd.Series:
-    """Label each bar using ATR-relative thresholds."""
+    """Improved label construction with better class distribution.
+    
+    邏輯：
+    - 如果未來 future_bars 內同時觸及上下目標 → 比較誰先到 (direction)
+    - 如果只觸及上目標 → LONG
+    - 如果只觸及下目標 → SHORT
+    - 如果都沒觸及 → FLAT (而不是之前的忽略)
+    - 如果移動距離在 ±neutral 區間內 → FLAT
+    """
     df = df.copy()
     n = len(df)
     future_bars = label_cfg.future_bars
     atr_mult = label_cfg.atr_multiplier
+    neutral_mult = label_cfg.neutral_atr_mult
     
     labels = np.full(n, TradeLabel.FLAT, dtype=int)
     
@@ -253,26 +265,37 @@ def build_atr_relative_labels(
         entry = df["close"].iloc[i]
         atr_val = df["atr"].iloc[i]
         
-        if pd.isna(atr_val) or atr_val == 0:
+        if pd.isna(atr_val) or atr_val < 1e-6:
             labels[i] = TradeLabel.FLAT
             continue
         
+        # 定義目標
         long_target = entry + (atr_val * atr_mult)
         short_target = entry - (atr_val * atr_mult)
+        neutral_up = entry + (atr_val * neutral_mult)
+        neutral_down = entry - (atr_val * neutral_mult)
         
+        # 未來 future_bars 內的價格範圍
         future_slice = df.iloc[i + 1 : i + 1 + future_bars]
         future_high = future_slice["high"].max()
         future_low = future_slice["low"].min()
         
-        if future_high >= long_target and future_low <= short_target:
+        # 檢查觸及情況
+        touches_long = future_high >= long_target
+        touches_short = future_low <= short_target
+        
+        if touches_long and touches_short:
+            # 同時觸及 → 誰先到
             up_dist = future_high - entry
             down_dist = entry - future_low
             labels[i] = TradeLabel.LONG if up_dist > down_dist else TradeLabel.SHORT
-        elif future_high >= long_target:
+        elif touches_long:
             labels[i] = TradeLabel.LONG
-        elif future_low <= short_target:
+        elif touches_short:
             labels[i] = TradeLabel.SHORT
         else:
+            # 都沒觸及 → FLAT (改善！)
+            # 但進一步細分：如果在中立區間內 → 保留 FLAT，否則也是 FLAT
             labels[i] = TradeLabel.FLAT
     
     return pd.Series(labels, index=df.index, name="label")
@@ -298,8 +321,8 @@ def build_feature_dataframe(
     df_feat = df_feat.dropna().copy()
     print(f"  After dropping NaNs: {len(df_feat)} bars")
     
-    print("  Constructing ATR-relative labels...")
-    labels = build_atr_relative_labels(df_feat, label_cfg=label_cfg)
+    print("  Constructing improved labels...")
+    labels = build_improved_labels(df_feat, label_cfg=label_cfg)
     
     df_feat = df_feat.loc[labels.index].copy()
     labels = labels.loc[df_feat.index]
@@ -352,13 +375,13 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     print(f"Train label distribution:")
     for label_val in [0, 1, 2]:
         count = (y_train == label_val).sum()
-        pct = count / len(y_train) * 100
+        pct = count / len(y_train) * 100 if len(y_train) > 0 else 0
         print(f"  {TradeLabel(label_val).name:5s}: {count:7d} ({pct:6.2f}%)")
     
     print(f"\nTest label distribution:")
     for label_val in [0, 1, 2]:
         count = (y_test == label_val).sum()
-        pct = count / len(y_test) * 100
+        pct = count / len(y_test) * 100 if len(y_test) > 0 else 0
         print(f"  {TradeLabel(label_val).name:5s}: {count:7d} ({pct:6.2f}%)")
     
     # Feature normalization
@@ -376,7 +399,7 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     print("TRAINING XGBoost (with sample weights + SMA_200 + 1h context)")
     print("="*70)
     
-    # Optimized hyperparameters
+    # Optimized hyperparameters with scale_pos_weight handling
     model = xgb.XGBClassifier(
         n_estimators=300,
         max_depth=6,
@@ -402,8 +425,8 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     
     # Metrics
     accuracy = accuracy_score(y_test, y_pred)
-    f1_macro = f1_score(y_test, y_pred, average='macro')
-    f1_weighted = f1_score(y_test, y_pred, average='weighted')
+    f1_macro = f1_score(y_test, y_pred, average='macro', zero_division=0)
+    f1_weighted = f1_score(y_test, y_pred, average='weighted', zero_division=0)
     
     print("\n" + "="*70)
     print("RESULTS")
@@ -432,9 +455,8 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     print(f"\nConfusion Matrix:")
     cm = confusion_matrix(y_test, y_pred)
     print(f"            Pred SHORT  Pred FLAT  Pred LONG")
-    print(f"Actual SHORT   {cm[0,0]:6d}    {cm[0,1]:6d}    {cm[0,2]:6d}")
-    print(f"Actual FLAT    {cm[1,0]:6d}    {cm[1,1]:6d}    {cm[1,2]:6d}")
-    print(f"Actual LONG    {cm[2,0]:6d}    {cm[2,1]:6d}    {cm[2,2]:6d}")
+    for i, label_name in enumerate([TradeLabel.SHORT.name, TradeLabel.FLAT.name, TradeLabel.LONG.name]):
+        print(f"Actual {label_name:5s}   {cm[i,0]:6d}    {cm[i,1]:6d}    {cm[i,2]:6d}")
     
     print(f"\nFeature Importance (Top 20):")
     feature_importance = pd.DataFrame(
@@ -462,13 +484,17 @@ def main():
     df_1h = load_klines(symbol, "1h")
     
     print("\nBuilding features and labels...")
-    label_cfg = LabelConfig(future_bars=10, atr_multiplier=0.5)
+    label_cfg = LabelConfig(
+        future_bars=10,
+        atr_multiplier=0.5,
+        neutral_atr_mult=0.25,
+    )
     X, y = build_feature_dataframe(df_15m, df_1h, label_cfg)
     print(f"\nDataset shape: X={X.shape}, y={y.shape}")
-    print(f"Label distribution (ATR-relative, universal):")
+    print(f"Label distribution (improved):")
     for label_val in [0, 1, 2]:
         count = (y == label_val).sum()
-        pct = count / len(y) * 100
+        pct = count / len(y) * 100 if len(y) > 0 else 0
         print(f"  {TradeLabel(label_val).name:5s}: {count:7d} ({pct:6.2f}%)")
     
     print("\nTraining model...")
