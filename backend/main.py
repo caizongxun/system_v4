@@ -2,6 +2,8 @@
 
 Provides REST API for K-line data and technical indicators,
 plus WebSocket support for real-time updates.
+
+Can be run as background service or standalone.
 """
 
 from fastapi import FastAPI, WebSocket, Query, HTTPException, WebSocketDisconnect
@@ -11,6 +13,8 @@ import json
 import logging
 from typing import Dict, List, Optional
 import asyncio
+import threading
+import time
 
 from config import settings, IndicatorConfiguration
 from data_loader import KLineDataLoader
@@ -287,7 +291,7 @@ async def websocket_chart(
             
             if command.get("action") == "ping":
                 # Respond to ping
-                await websocket.send_json({"action": "pong", "timestamp": asyncio.get_event_loop().time()})
+                await websocket.send_json({"action": "pong", "timestamp": time.time()})
             
             elif command.get("action") == "update":
                 # Client requested chart update
@@ -318,12 +322,39 @@ async def websocket_chart(
         manager.disconnect(websocket, symbol, timeframe)
 
 
-if __name__ == "__main__":
+def run_backend(host: str = settings.API_HOST, port: int = settings.API_PORT):
+    """
+    Run the backend service.
+    Can be called from frontend application to start backend in background thread.
+    """
     import uvicorn
     
+    logger.info(f"Starting System V4 Backend on {host}:{port}")
     uvicorn.run(
         app,
-        host=settings.API_HOST,
-        port=settings.API_PORT,
+        host=host,
+        port=port,
         log_level=settings.LOG_LEVEL.lower()
     )
+
+
+def start_backend_thread(host: str = settings.API_HOST, port: int = settings.API_PORT) -> threading.Thread:
+    """
+    Start backend service in a background thread.
+    Returns the thread object.
+    """
+    backend_thread = threading.Thread(
+        target=run_backend,
+        args=(host, port),
+        daemon=True
+    )
+    backend_thread.start()
+    logger.info("Backend thread started")
+    
+    # Wait for backend to be ready
+    time.sleep(2)
+    return backend_thread
+
+
+if __name__ == "__main__":
+    run_backend()
