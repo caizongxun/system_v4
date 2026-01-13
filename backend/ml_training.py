@@ -3,7 +3,7 @@
 This script loads OHLCV data from the HuggingFace dataset
 `zongowo111/v2-crypto-ohlcv-data`, builds engineered features
 (momentum, volatility and custom composite indicators),
-onstructs trade labels based on ATR stop loss and 1:1.5 risk-reward,
+constructs trade labels based on ATR stop loss and 1:1.5 risk-reward,
 then trains a baseline model to predict whether to enter long, short or stay flat
 on the next bar given the last fully closed bar.
 
@@ -143,10 +143,10 @@ def add_custom_composite_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # Momentum-volatility composite
     mom_norm = (df["mom_return"] - df["mom_return"].rolling(100).mean()) / (
-        df["mom_return"].rolling(100).std()
+        df["mom_return"].rolling(100).std() + 1e-8
     )
     vol_norm = (df["vol_return"] - df["vol_return"].rolling(100).mean()) / (
-        df["vol_return"].rolling(100).std()
+        df["vol_return"].rolling(100).std() + 1e-8
     )
 
     df["momentum_vol_score"] = 0.7 * mom_norm + 0.3 * vol_norm
@@ -155,13 +155,14 @@ def add_custom_composite_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==============================
-# Label Construction
+# Label Construction (Fixed)
 # ==============================
 
 
 def build_trade_labels(
     df: pd.DataFrame,
     atr_cfg: ATRConfig,
+    debug: bool = False,
 ) -> pd.Series:
     """Label each bar t as LONG, SHORT or FLAT.
 
@@ -171,12 +172,12 @@ def build_trade_labels(
     - Short: entry at close_t, SL = close_t + ATR_t, TP = close_t - ATR_t * rr
 
     We simulate future bars (t+1, t+2, ...) until either TP or SL is hit.
-    The first hit decides outcome. Bars covered by an open trade are not
-    allowed to open new trades (non-overlapping constraint).
+    Only TP hits result in a label (LONG or SHORT). Bars covered by an open
+    trade are not allowed to open new trades (non-overlapping constraint).
 
     Outcome mapping:
-    - If long TP hit first: label LONG at t
-    - If short TP hit first: label SHORT at t
+    - If long TP hit first (before any SL): label LONG at t
+    - If short TP hit first (before any SL): label SHORT at t
     - Else: FLAT
     """
     df = df.copy()
@@ -188,9 +189,16 @@ def build_trade_labels(
     n = len(df)
 
     labels = np.full(n, TradeLabel.FLAT, dtype=int)
+    trade_end_indices = np.full(n, -1, dtype=int)  # Track where each trade ends
 
     i = 0
+    debug_count = 0
     while i < n - 1:
+        # Skip if already covered by previous trade
+        if trade_end_indices[i] > i:
+            i += 1
+            continue
+
         if np.isnan(atr[i]) or atr[i] <= 0:
             i += 1
             continue
@@ -205,70 +213,86 @@ def build_trade_labels(
         short_sl = entry + risk
         short_tp = entry - reward
 
-        # Simulate future path
+        # Simulate future path to find TP or SL
         j = i + 1
-        long_hit: Optional[int] = None
-        short_hit: Optional[int] = None
+        long_tp_hit = None
+        long_sl_hit = None
+        short_tp_hit = None
+        short_sl_hit = None
 
-        while j < n:
+        max_lookahead = min(50, n - i - 1)
+
+        while j < i + 1 + max_lookahead:
             bar_high = high[j]
             bar_low = low[j]
 
-            # Long TP/SL
-            if long_hit is None:
-                if bar_high >= long_tp:
-                    long_hit = j
-                elif bar_low <= long_sl:
-                    long_hit = -j  # SL hit
+            # Long: check TP first, then SL (TP takes priority if both in same bar)
+            if long_tp_hit is None and bar_high >= long_tp:
+                long_tp_hit = j
+            elif long_sl_hit is None and bar_low <= long_sl:
+                long_sl_hit = j
 
-            # Short TP/SL
-            if short_hit is None:
-                if bar_low <= short_tp:
-                    short_hit = j
-                elif bar_high >= short_sl:
-                    short_hit = -j  # SL hit
+            # Short: check TP first, then SL
+            if short_tp_hit is None and bar_low <= short_tp:
+                short_tp_hit = j
+            elif short_sl_hit is None and bar_high >= short_sl:
+                short_sl_hit = j
 
-            # Stop early if both directions decided or horizon exceeded
-            if long_hit is not None and short_hit is not None:
-                break
-
-            # Optional horizon to avoid extremely long lookahead
-            if j - i > 50:
+            # Early exit: both sides have hit something
+            if (long_tp_hit is not None or long_sl_hit is not None) and \
+               (short_tp_hit is not None or short_sl_hit is not None):
                 break
 
             j += 1
 
-        # Decide label based on which profitable side hit first
+        # Decide label: only label LONG or SHORT if TP is hit before SL
         outcome = TradeLabel.FLAT
-        # Interpret indices: positive = TP, negative = SL
-        if long_hit is not None and short_hit is not None:
-            # Compare absolute bar index of first hit
-            if abs(long_hit) < abs(short_hit) and long_hit > 0:
+        trade_close_idx = None
+
+        # Check if long TP hit before long SL
+        long_is_profitable = long_tp_hit is not None and \
+                             (long_sl_hit is None or long_tp_hit <= long_sl_hit)
+
+        # Check if short TP hit before short SL
+        short_is_profitable = short_tp_hit is not None and \
+                              (short_sl_hit is None or short_tp_hit <= short_sl_hit)
+
+        if long_is_profitable and short_is_profitable:
+            # Both are profitable, pick the one that hits first
+            if long_tp_hit <= short_tp_hit:
                 outcome = TradeLabel.LONG
-            elif abs(short_hit) < abs(long_hit) and short_hit > 0:
+                trade_close_idx = long_tp_hit
+            else:
                 outcome = TradeLabel.SHORT
-        elif long_hit is not None and long_hit > 0:
+                trade_close_idx = short_tp_hit
+        elif long_is_profitable:
             outcome = TradeLabel.LONG
-        elif short_hit is not None and short_hit > 0:
+            trade_close_idx = long_tp_hit
+        elif short_is_profitable:
             outcome = TradeLabel.SHORT
+            trade_close_idx = short_tp_hit
 
         labels[i] = int(outcome)
 
+        if debug and debug_count < 10 and outcome != TradeLabel.FLAT:
+            print(f"Bar {i}: entry={entry:.2f}, atr={atr[i]:.2f}, "
+                  f"long_tp={long_tp:.2f} (hit@{long_tp_hit}), "
+                  f"long_sl={long_sl:.2f} (hit@{long_sl_hit}), "
+                  f"short_tp={short_tp:.2f} (hit@{short_tp_hit}), "
+                  f"short_sl={short_sl:.2f} (hit@{short_sl_hit}), "
+                  f"label={TradeLabel(outcome).name}")
+            debug_count += 1
+
         if outcome == TradeLabel.FLAT:
-            # No trade opened, move to next bar
             i += 1
         else:
-            # Trade opened at i and closed at first TP/SL bar
-            # Skip all bars covered by this trade to avoid overlap
-            if outcome == TradeLabel.LONG:
-                end_index = abs(long_hit)
+            # Mark the range of this trade as covered
+            if trade_close_idx is not None:
+                for idx in range(i, trade_close_idx + 1):
+                    trade_end_indices[idx] = trade_close_idx
+                i = trade_close_idx + 1
             else:
-                end_index = abs(short_hit)
-
-            if end_index is None or end_index <= i:
                 i += 1
-            else:
-                i = end_index + 1
 
     return pd.Series(labels, index=df.index, name="label")
 
@@ -291,7 +315,7 @@ def build_feature_dataframe(
     df_feat = df_feat.dropna().copy()
 
     # Build labels
-    labels = build_trade_labels(df_feat, atr_cfg=atr_cfg)
+    labels = build_trade_labels(df_feat, atr_cfg=atr_cfg, debug=True)
 
     # Align and drop rows without labels
     df_feat = df_feat.loc[labels.index]
