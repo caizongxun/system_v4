@@ -1,15 +1,15 @@
-"""ML training pipeline for System V4 - New Label Strategy.
+"""ML training pipeline for System V4 - Balanced Label Strategy.
 
 This script loads OHLCV data from the HuggingFace dataset,
 builds engineered features with technical indicators,
-constructs trade labels using improved logic,
+constructs trade labels using quantile-based approach for class balance,
 and trains an XGBoost model to achieve 70%+ accuracy.
 
-Improvements:
+Key improvements:
+- Quantile-based label generation for balanced classes
 - Technical indicators: RSI, MACD, Bollinger Bands, ATR
-- Improved label logic: trend-following + momentum
-- Aggressive hyperparameter tuning
-- Feature selection and normalization
+- Class weight balancing in XGBoost
+- Strategic hyperparameter tuning
 """
 
 from __future__ import annotations
@@ -57,8 +57,6 @@ class TradeLabel(IntEnum):
 class LabelConfig:
     """Configuration for label construction."""
     future_bars: int = 10
-    momentum_threshold: float = 0.005  # 0.5% momentum threshold
-    volatility_threshold: float = 0.02  # 2% volatility threshold
 
 
 # ==============================
@@ -201,60 +199,41 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==============================
-# Label Construction - New Strategy
+# Label Construction - Quantile-Based
 # ==============================
 
 
-def build_improved_labels(
+def build_quantile_labels(
     df: pd.DataFrame,
     label_cfg: LabelConfig,
 ) -> pd.Series:
-    """Label each bar using multi-factor logic.
+    """Label each bar using future returns (top 33% = LONG, bottom 33% = SHORT, middle = FLAT).
     
-    LONG: Strong uptrend + positive momentum
-    SHORT: Strong downtrend + negative momentum
-    FLAT: Sideways/uncertain
+    This ensures balanced class distribution automatically.
     """
     df = df.copy()
     n = len(df)
     future_bars = label_cfg.future_bars
-    mom_thresh = label_cfg.momentum_threshold
-    vol_thresh = label_cfg.volatility_threshold
     
-    labels = np.full(n, TradeLabel.FLAT, dtype=int)
+    future_returns = []
     
     for i in range(n - future_bars):
         entry = df["close"].iloc[i]
-        future_slice = df.iloc[i + 1 : i + 1 + future_bars]
-        
-        future_high = future_slice["high"].max()
-        future_low = future_slice["low"].min()
-        future_close = future_slice["close"].iloc[-1]
-        
-        up_move = (future_high - entry) / entry
-        down_move = (entry - future_low) / entry
-        close_move = (future_close - entry) / entry
-        
-        # Current indicators
-        current_rsi = df["rsi_14"].iloc[i]
-        current_macd_hist = df["macd_hist"].iloc[i]
-        current_trend = df["trend_10"].iloc[i]
-        current_bb_pos = df["bb_position"].iloc[i]
-        
-        # Logic
-        # Strong uptrend
-        if (up_move > 0.02 and down_move < 0.01 and close_move > 0.005 and 
-            current_rsi > 50 and current_macd_hist > 0 and current_trend > 0):
-            labels[i] = TradeLabel.LONG
-        # Strong downtrend
-        elif (down_move > 0.02 and up_move < 0.01 and close_move < -0.005 and 
-              current_rsi < 50 and current_macd_hist < 0 and current_trend < 0):
-            labels[i] = TradeLabel.SHORT
-        # Everything else
-        else:
-            labels[i] = TradeLabel.FLAT
+        future_close = df["close"].iloc[i + future_bars]
+        ret = (future_close - entry) / entry
+        future_returns.append(ret)
     
-    return pd.Series(labels, index=df.index, name="label")
+    future_returns = np.array(future_returns)
+    
+    # Quantile-based labeling for class balance
+    q33 = np.percentile(future_returns, 33.33)
+    q67 = np.percentile(future_returns, 66.67)
+    
+    labels = np.full(len(future_returns), TradeLabel.FLAT, dtype=int)
+    labels[future_returns <= q33] = TradeLabel.SHORT
+    labels[future_returns >= q67] = TradeLabel.LONG
+    
+    return pd.Series(labels, index=df.index[:len(future_returns)], name="label")
 
 
 # ==============================
@@ -273,12 +252,12 @@ def build_feature_dataframe(
     df_feat = df_feat.dropna().copy()
     print(f"  After dropping NaNs: {len(df_feat)} bars")
     
-    print("  Constructing improved labels...")
-    labels = build_improved_labels(df_feat, label_cfg=label_cfg)
+    print("  Constructing quantile-based labels...")
+    labels = build_quantile_labels(df_feat, label_cfg=label_cfg)
     
-    df_feat = df_feat.loc[labels.index]
-    labels_shifted = labels.shift(-1).dropna()
-    df_feat = df_feat.loc[labels_shifted.index]
+    # Align features and labels
+    df_feat = df_feat.loc[labels.index].copy()
+    labels = labels.loc[df_feat.index]
     
     # Select best features
     feature_cols = [
@@ -295,7 +274,7 @@ def build_feature_dataframe(
     ]
     
     X = df_feat[feature_cols].copy()
-    y = labels_shifted.astype(int)
+    y = labels.astype(int)
     return X, y
 
 
@@ -305,7 +284,7 @@ def build_feature_dataframe(
 
 
 def train_xgboost(X: pd.DataFrame, y: pd.Series):
-    """Train XGBoost with aggressive tuning."""
+    """Train XGBoost with class weight balancing."""
     print("\n" + "="*70)
     print("SPLITTING DATA")
     print("="*70)
@@ -315,8 +294,15 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     print(f"Train: {len(X_train)}, Test: {len(X_test)}")
     print(f"Train label distribution:")
     for label_val in [0, 1, 2]:
-        pct = (y_train == label_val).sum() / len(y_train) * 100
-        print(f"  {TradeLabel(label_val).name:5s}: {pct:6.2f}%")
+        count = (y_train == label_val).sum()
+        pct = count / len(y_train) * 100
+        print(f"  {TradeLabel(label_val).name:5s}: {count:7d} ({pct:6.2f}%)")
+    
+    print(f"\nTest label distribution:")
+    for label_val in [0, 1, 2]:
+        count = (y_test == label_val).sum()
+        pct = count / len(y_test) * 100
+        print(f"  {TradeLabel(label_val).name:5s}: {count:7d} ({pct:6.2f}%)")
     
     # Feature normalization
     print("\n  Normalizing features...")
@@ -325,18 +311,18 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     X_test_scaled = scaler.transform(X_test)
     
     print("\n" + "="*70)
-    print("TRAINING XGBoost (Aggressive)")
+    print("TRAINING XGBoost")
     print("="*70)
     
-    # Aggressive hyperparameters
+    # Balanced hyperparameters
     model = xgb.XGBClassifier(
-        n_estimators=500,
-        max_depth=6,
-        learning_rate=0.1,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        gamma=0,
-        min_child_weight=1,
+        n_estimators=300,
+        max_depth=7,
+        learning_rate=0.08,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        gamma=0.5,
+        min_child_weight=2,
         random_state=42,
         n_jobs=-1,
         verbosity=0,
@@ -368,6 +354,7 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
         print(f"\n✓ TARGET ACHIEVED: {accuracy*100:.2f}% >= 70%")
     else:
         print(f"\n✗ Target not reached: {accuracy*100:.2f}% < 70%")
+        print(f"  Gap to 70%: {(0.70 - accuracy)*100:.2f}%")
     
     print(f"\nClassification Report:")
     print(
@@ -394,7 +381,7 @@ def train_xgboost(X: pd.DataFrame, y: pd.Series):
     for idx, row in feature_importance.head(15).iterrows():
         print(f"  {row['feature']:20s}: {row['importance']:.4f}")
     
-    return model, accuracy, f1_macro
+    return model, accuracy, f1_macro, f1_weighted
 
 
 # ==============================
@@ -410,16 +397,17 @@ def main():
     df = load_klines(symbol, timeframe)
     
     print("\nBuilding features and labels...")
-    label_cfg = LabelConfig(future_bars=10, momentum_threshold=0.005, volatility_threshold=0.02)
+    label_cfg = LabelConfig(future_bars=10)
     X, y = build_feature_dataframe(df, label_cfg)
     print(f"\nDataset shape: X={X.shape}, y={y.shape}")
-    print(f"Label distribution:")
+    print(f"Label distribution (quantile-based - balanced):")
     for label_val in [0, 1, 2]:
-        pct = (y == label_val).sum() / len(y) * 100
-        print(f"  {TradeLabel(label_val).name:5s}: {pct:6.2f}%")
+        count = (y == label_val).sum()
+        pct = count / len(y) * 100
+        print(f"  {TradeLabel(label_val).name:5s}: {count:7d} ({pct:6.2f}%)")
     
     print("\nTraining model...")
-    model, accuracy, f1_macro = train_xgboost(X, y)
+    model, accuracy, f1_macro, f1_weighted = train_xgboost(X, y)
     
     print("\n" + "="*70)
     print("COMPLETE")
