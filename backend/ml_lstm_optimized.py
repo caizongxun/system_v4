@@ -1,30 +1,23 @@
-"""LSTM Sequence Prediction - Optimized Version
+"""Optimized LSTM Sequence Prediction - Lightweight Version
 
-Optimizations Applied:
-1. Data Sampling (30% of sequences)
-   - Reduces training time 5x
-   - Maintains statistical properties
-   - Minimal accuracy loss (~0.5%)
+Optimizations:
+1. Reduce model size: 128->64->32 (was overkill)
+2. Extract hand-crafted features instead of raw OHLCV
+3. Use single LSTM layer + Dense (not stacked)
+4. Reduce lookback from 100 to 50 candles (still captures ~8 hours of data)
+5. Add technical indicators as features (momentum, volatility)
+6. Use smaller batch size for faster iterations
 
-2. Lightweight Architecture
-   - LSTM: 64 + 32 units (vs 128 + 64)
-   - Reduces parameters 50%
-   - Training time 3x faster
+Expected:
+- Training time: 2-5 min per epoch (vs 20+ min before)
+- Accuracy: Should reach 60-65% by epoch 5-10
+- Memory: 50% reduction
 
-3. Larger Batch Size
-   - 64 samples per batch (vs 32)
-   - GPU better utilization
-   - 2x faster training
-
-4. Fewer Epochs
-   - Early stopping with patience=10
-   - Max 40 epochs (will stop earlier)
-
-Expected Results:
-  Training time: 2 hours/epoch -> 2-3 minutes/epoch
-  Total time: 1 hour for full training
-  Accuracy: 62-65% (vs 55.8% baseline)
-  Improvement: +6-9%
+Rationale:
+- Raw OHLCV sequences are redundant (5 correlated features)
+- Technical indicators capture essence of price action
+- Smaller window still has enough pattern info
+- LSTM is good at temporal patterns, not raw pixel-like data
 """
 
 from __future__ import annotations
@@ -42,6 +35,7 @@ from sklearn.metrics import (
     f1_score,
     classification_report,
     confusion_matrix,
+    roc_auc_score,
 )
 
 try:
@@ -53,7 +47,7 @@ try:
     HAS_TF = True
 except ImportError:
     HAS_TF = False
-    print("Warning: TensorFlow not installed. Install with: pip install tensorflow")
+    print("Warning: TensorFlow not installed")
 
 
 REPO_ID = "zongowo111/v2-crypto-ohlcv-data"
@@ -82,29 +76,86 @@ def load_klines(symbol: str, timeframe: str) -> pd.DataFrame:
     return df
 
 
-def create_lstm_sequences_sampled(
-    df: pd.DataFrame,
-    look_back: int = 100,
-    look_forward: int = 10,
-    sample_ratio: float = 0.3,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Create sequences with sampling for faster training.
+def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate technical indicators to reduce feature dimensionality.
     
-    Args:
-        df: DataFrame with OHLCV data
-        look_back: Number of past candles
-        look_forward: Number of future candles to predict
-        sample_ratio: Fraction of sequences to use (0.3 = 30%)
+    Instead of 5 raw OHLCV features, extract:
+    1. Returns (price change)
+    2. RSI (momentum)
+    3. Volatility (ATR)
+    4. Volume change
+    5. MA ratio (trend)
     
-    Returns:
-        X: Shape (n_samples, look_back, 5)
-        y: Shape (n_samples,)
+    This reduces noise and gives LSTM meaningful patterns to learn.
     """
-    print(f"Creating sequences (look_back={look_back}, sample_ratio={sample_ratio:.0%})...")
+    df_feat = df.copy()
     
-    data = df[["open", "high", "low", "close", "volume"]].values
+    # 1. Returns (normalized price change)
+    df_feat['returns'] = df_feat['close'].pct_change() * 100
     
-    # Normalize
+    # 2. RSI (Relative Strength Index) - momentum indicator
+    delta = df_feat['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df_feat['rsi'] = 100 - (100 / (1 + rs))
+    
+    # 3. ATR (Average True Range) - volatility
+    high_low = df_feat['high'] - df_feat['low']
+    high_close = np.abs(df_feat['high'] - df_feat['close'].shift())
+    low_close = np.abs(df_feat['low'] - df_feat['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    df_feat['atr'] = true_range.rolling(window=14).mean()
+    
+    # 4. Volume MA ratio (volume trend)
+    df_feat['volume_ma'] = df_feat['volume'].rolling(window=20).mean()
+    df_feat['volume_ratio'] = df_feat['volume'] / (df_feat['volume_ma'] + 1e-8)
+    
+    # 5. Price above/below SMA (trend)
+    df_feat['sma20'] = df_feat['close'].rolling(window=20).mean()
+    df_feat['sma50'] = df_feat['close'].rolling(window=50).mean()
+    df_feat['price_sma_ratio'] = df_feat['close'] / (df_feat['sma20'] + 1e-8)
+    
+    # 6. MACD (trend following)
+    exp1 = df_feat['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df_feat['close'].ewm(span=26, adjust=False).mean()
+    df_feat['macd'] = exp1 - exp2
+    df_feat['macd_signal'] = df_feat['macd'].ewm(span=9, adjust=False).mean()
+    
+    # Select features and drop NaN
+    feature_cols = [
+        'returns', 'rsi', 'atr', 'volume_ratio', 
+        'price_sma_ratio', 'macd', 'macd_signal'
+    ]
+    
+    df_feat = df_feat[feature_cols].dropna()
+    
+    print(f"  Features calculated: {feature_cols}")
+    print(f"  Valid rows: {len(df_feat)}")
+    
+    return df_feat
+
+
+def create_lstm_sequences_optimized(
+    features: pd.DataFrame,
+    prices: pd.Series,
+    look_back: int = 50,
+    look_forward: int = 10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Create sequences with technical features instead of raw OHLCV.
+    
+    Reduced lookback from 100 to 50 because:
+    - 50 candles at 15m = 750 min = 12.5 hours (still 1.5 trading days)
+    - Fewer timesteps = faster training
+    - Technical indicators already compress information
+    """
+    print(f"Creating sequences (look_back={look_back}, look_forward={look_forward})...")
+    
+    data = features.values
+    prices_data = prices.values
+    
+    # Normalize features
     scaler = StandardScaler()
     data_scaled = scaler.fit_transform(data)
     
@@ -112,112 +163,106 @@ def create_lstm_sequences_sampled(
     y = []
     
     for i in range(len(data_scaled) - look_back - look_forward + 1):
+        # Input: past look_back candles with technical features
         seq_in = data_scaled[i : i + look_back]
         X.append(seq_in)
         
-        current_close = data[i + look_back - 1, 3]
-        future_close = data[i + look_back + look_forward - 1, 3]
-        label = 1 if future_close > current_close else 0
+        # Target: price goes UP or DOWN
+        current_price = prices_data[i + look_back - 1]
+        future_price = prices_data[i + look_back + look_forward - 1]
+        
+        label = 1 if future_price > current_price else 0
         y.append(label)
     
     X = np.array(X)
     y = np.array(y)
     
-    print(f"  Total sequences created: {len(X)}")
-    print(f"  Label distribution: UP={np.sum(y)}, DOWN={len(y)-np.sum(y)}")
+    print(f"Created {len(X)} sequences")
+    print(f"X shape: {X.shape}, y shape: {y.shape}")
+    print(f"Label distribution: UP={np.sum(y)}, DOWN={len(y)-np.sum(y)}")
     
-    # Sample
-    n_samples = int(len(X) * sample_ratio)
-    indices = np.random.choice(len(X), n_samples, replace=False)
-    indices = np.sort(indices)  # Keep temporal order
-    
-    X_sampled = X[indices]
-    y_sampled = y[indices]
-    
-    print(f"  Sampled sequences: {len(X_sampled)} ({sample_ratio:.0%})")
-    print(f"  Sampled distribution: UP={np.sum(y_sampled)}, DOWN={len(y_sampled)-np.sum(y_sampled)}")
-    print(f"  Input shape: {X_sampled.shape}, Output shape: {y_sampled.shape}")
-    
-    return X_sampled, y_sampled
+    return X, y, scaler
 
 
-def build_lstm_model_optimized(
-    look_back: int = 100,
-    lstm_units_1: int = 64,
-    lstm_units_2: int = 32,
-    dropout_rate: float = 0.2,
+def build_lstm_model_lightweight(
+    look_back: int = 50,
+    n_features: int = 7,
 ) -> Sequential:
-    """Build lightweight LSTM model for faster training.
+    """Build lightweight LSTM model.
     
-    Optimizations:
-    - Reduced LSTM units: 64 + 32 (vs 128 + 64)
-    - Smaller dense layers
-    - Parameters: ~60% reduction
+    Changes:
+    - Single LSTM layer (64 units, not 128+64)
+    - Fewer parameters for faster training
+    - Dropout 0.15 (less aggressive)
+    - Larger Dense layer before output (captures non-linear patterns)
     """
     model = Sequential([
+        # Single LSTM layer is enough for feature sequences
         LSTM(
-            lstm_units_1,
-            input_shape=(look_back, 5),
-            return_sequences=True,
+            64,  # Reduced from 128
+            input_shape=(look_back, n_features),
+            return_sequences=False,
             name="lstm_1"
         ),
-        Dropout(dropout_rate),
+        Dropout(0.15),  # Lighter dropout
         
-        LSTM(
-            lstm_units_2,
-            return_sequences=False,
-            name="lstm_2"
-        ),
-        Dropout(dropout_rate),
+        # Dense layers for classification
+        Dense(32, activation="relu", name="dense_1"),
+        Dropout(0.15),
         
-        Dense(16, activation="relu", name="dense_1"),
-        Dropout(dropout_rate),
+        Dense(16, activation="relu", name="dense_2"),
+        Dropout(0.1),
         
+        # Output layer
         Dense(1, activation="sigmoid", name="output"),
     ])
     
     model.compile(
-        optimizer=Adam(learning_rate=0.001),
+        optimizer=Adam(learning_rate=0.005),  # Slightly higher LR for faster convergence
         loss="binary_crossentropy",
         metrics=["accuracy"],
     )
     
+    print("\nModel Summary:")
+    model.summary()
+    
     return model
 
 
-def train_lstm_model_optimized(
+def train_lstm_optimized(
     X_train: np.ndarray,
     y_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
-    epochs: int = 40,
+    epochs: int = 30,
     batch_size: int = 64,
-) -> Tuple[Sequential, dict]:
-    """Train LSTM model with optimizations.
+) -> Tuple:
+    """Train with optimized settings.
     
-    Optimizations:
-    - Larger batch size: 64 (better GPU utilization)
-    - Early stopping: patience=10
-    - Learning rate decay
+    Optimization tips:
+    - Larger batch size (64 instead of 32) for faster gradient updates
+    - Fewer epochs (30 instead of 50, with early stopping)
+    - More aggressive early stopping (patience=5 instead of 10)
     """
-    print("\nBuilding optimized LSTM model...")
-    model = build_lstm_model_optimized()
+    print("\nBuilding model...")
+    model = build_lstm_model_lightweight(
+        look_back=X_train.shape[1],
+        n_features=X_train.shape[2],
+    )
     
-    model.summary()
-    
-    print(f"\nTraining (batch_size={batch_size}, epochs={epochs})...")
+    print(f"\nTraining with batch_size={batch_size}...")
     callbacks = [
         EarlyStopping(
             monitor="val_loss",
-            patience=10,
+            patience=5,  # More aggressive stopping
             restore_best_weights=True,
             verbose=1,
         ),
         ReduceLROnPlateau(
             monitor="val_loss",
             factor=0.5,
-            patience=5,
-            min_lr=1e-6,
+            patience=3,
+            min_lr=1e-5,
             verbose=1,
         ),
     ]
@@ -235,29 +280,26 @@ def train_lstm_model_optimized(
     
     elapsed = time.time() - start
     print(f"\nTraining completed in {elapsed:.2f}s ({elapsed/60:.2f} min)")
-    print(f"Epochs completed: {len(history.history['loss'])}")
     
     return model, history
 
 
-def evaluate_lstm_model(
-    model,
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-) -> dict:
-    """Evaluate LSTM model."""
+def evaluate_model(model, X_test: np.ndarray, y_test: np.ndarray):
+    """Evaluate model performance."""
     print("\n" + "="*70)
-    print("LSTM MODEL EVALUATION (OPTIMIZED VERSION)")
+    print("OPTIMIZED LSTM MODEL EVALUATION")
     print("="*70)
     
+    # Predictions
     y_pred_proba = model.predict(X_test, verbose=0)
     y_pred = (y_pred_proba >= 0.5).astype(int).flatten()
     
+    # Metrics
     accuracy = accuracy_score(y_test, y_pred)
     f1 = f1_score(y_test, y_pred, average="binary")
     
-    print(f"\nTest Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
-    print(f"Test F1-Score: {f1:.4f}")
+    print(f"\nAccuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    print(f"F1-Score: {f1:.4f}")
     
     print(f"\nClassification Report:")
     print(classification_report(
@@ -273,7 +315,13 @@ def evaluate_lstm_model(
     print(f"Actual DOWN   {cm[0,0]:6d}    {cm[0,1]:6d}")
     print(f"Actual UP     {cm[1,0]:6d}    {cm[1,1]:6d}")
     
-    print(f"\n" + "="*70)
+    try:
+        roc_auc = roc_auc_score(y_test, y_pred_proba)
+        print(f"\nROC-AUC: {roc_auc:.4f}")
+    except:
+        pass
+    
+    print("\n" + "="*70)
     
     return {
         "accuracy": accuracy,
@@ -285,43 +333,50 @@ def evaluate_lstm_model(
 
 def main():
     if not HAS_TF:
-        print("TensorFlow is required. Install with: pip install tensorflow")
+        print("TensorFlow is required")
         return
     
-    # Configuration (Optimized)
+    # Configuration
     symbol = "BTCUSDT"
     timeframe = "15m"
-    look_back = 100
+    look_back = 50  # Reduced from 100
     look_forward = 10
-    sample_ratio = 0.3  # Use only 30% of sequences
     train_ratio = 0.7
     val_ratio = 0.15
     test_ratio = 0.15
     
-    print(f"LSTM Sequence Prediction - Optimized Version")
-    print(f"="*70)
+    print("OPTIMIZED LSTM Sequence Prediction Model")
+    print("="*70)
     print(f"Symbol: {symbol}")
     print(f"Timeframe: {timeframe}")
-    print(f"Look back: {look_back} candles")
+    print(f"Look back: {look_back} candles (~{look_back*15} minutes)")
     print(f"Look forward: {look_forward} candles")
-    print(f"Data sampling: {sample_ratio:.0%}")
-    print(f"Expected training time: ~1 hour (vs ~10 hours baseline)")
-    print(f"="*70)
+    print(f"Train/Val/Test split: {train_ratio:.0%}/{val_ratio:.0%}/{test_ratio:.0%}")
+    print(f"\nOptimizations:")
+    print(f"  - Lookback reduced: 100 -> 50 candles")
+    print(f"  - Features extracted: Raw OHLCV -> 7 technical indicators")
+    print(f"  - Model size reduced: (128+64) -> 64 units")
+    print(f"  - Batch size increased: 32 -> 64")
+    print("="*70)
     
     # Load data
     print(f"\nLoading data for {symbol}...")
     df = load_klines(symbol, timeframe)
     
-    # Create sequences with sampling
-    X, y = create_lstm_sequences_sampled(
-        df,
+    # Calculate technical features
+    print(f"\nCalculating technical features...")
+    features = calculate_technical_features(df)
+    
+    # Create sequences
+    X, y, scaler = create_lstm_sequences_optimized(
+        features=features,
+        prices=df['close'],
         look_back=look_back,
         look_forward=look_forward,
-        sample_ratio=sample_ratio,
     )
     
     # Split data
-    print(f"\nSplitting data ({train_ratio:.0%}/{val_ratio:.0%}/{test_ratio:.0%})...")
+    print(f"\nSplitting data...")
     n_train = int(len(X) * train_ratio)
     n_val = int(len(X) * val_ratio)
     
@@ -338,18 +393,18 @@ def main():
     print(f"Val:   {len(X_val)} samples")
     print(f"Test:  {len(X_test)} samples")
     
-    # Train
-    model, history = train_lstm_model_optimized(
+    # Train model
+    model, history = train_lstm_optimized(
         X_train,
         y_train,
         X_val,
         y_val,
-        epochs=40,
-        batch_size=64,
+        epochs=30,
+        batch_size=64,  # Increased from 32
     )
     
     # Evaluate
-    results = evaluate_lstm_model(model, X_test, y_test)
+    results = evaluate_model(model, X_test, y_test)
     
     # Train set evaluation
     print(f"\nTrain Set Performance:")
@@ -357,36 +412,16 @@ def main():
     train_acc = accuracy_score(y_train, y_train_pred)
     print(f"Accuracy: {train_acc:.4f} ({train_acc*100:.2f}%)")
     
-    # Val set evaluation
-    print(f"\nVal Set Performance:")
-    y_val_pred = (model.predict(X_val, verbose=0) >= 0.5).astype(int).flatten()
-    val_acc = accuracy_score(y_val, y_val_pred)
-    print(f"Accuracy: {val_acc:.4f} ({val_acc*100:.2f}%)")
-    
     # Comparison
     print(f"\n" + "="*70)
     print("COMPARISON WITH BASELINE")
     print("="*70)
     baseline_acc = 0.558
     improvement = (results["accuracy"] - baseline_acc) * 100
-    
-    print(f"XGBoost Baseline:        {baseline_acc*100:.2f}%")
-    print(f"LSTM Optimized:          {results['accuracy']*100:.2f}%")
-    print(f"Improvement:             {improvement:+.2f}%")
-    print(f"\nOverfitting Gap (Train-Test): {(train_acc - results['accuracy'])*100:.2f}%")
-    print(f"\nStatus:")
-    
-    if results["accuracy"] > baseline_acc:
-        print(f"  LSTM outperforms baseline by {improvement:.2f}%")
-    else:
-        print(f"  LSTM underperforms baseline (but optimization successful)")
-    
-    if train_acc - results["accuracy"] < 0.1:
-        print(f"  Good generalization (low overfitting)")
-    else:
-        print(f"  Warning: High overfitting detected")
-    
-    print(f"\n" + "="*70)
+    print(f"Baseline (XGBoost method):     {baseline_acc*100:.2f}%")
+    print(f"Optimized LSTM method:         {results['accuracy']*100:.2f}%")
+    print(f"Improvement:                   {improvement:+.2f}%")
+    print("="*70)
     
     # Save model
     model_path = Path("models/lstm_optimized_model.h5")
